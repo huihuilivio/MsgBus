@@ -51,3 +51,7 @@ conan/
 # OS files
 Thumbs.db
 .DS_Store
+
+CoverageReport*/
+LastCoverageResults.log
+coverage.xml
