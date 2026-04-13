@@ -5,9 +5,12 @@
 ## 特性
 
 - **高吞吐**：单线程发布 600 万+ QPS，多线程 500 万+ QPS
-- **低延迟**：publish→handler p50 ≈ 3.6μs
+- **低延迟**：对象池优化后 publish→handler 最小延迟 ~0.3μs
 - **无锁发布**：基于 Vyukov bounded MPMC 队列，publish 路径完全无锁
+- **Zero-copy**：侵入式引用计数 + 对象池，消除 `shared_ptr` 开销
 - **类型安全**：模板 + 运行时类型校验，同一 topic 只允许一种消息类型
+- **MQTT 通配符**：`*` 匹配单层、`#` 匹配多层，灵活的 topic 路由
+- **多 Dispatcher**：线程池模式，topic hash 分片，水平扩展消费能力
 - **C++20 协程**：`co_await bus.async_wait<T>(topic)` 原生协程等待
 - **Header-only**：仅需 include，零依赖
 
@@ -73,15 +76,24 @@ target_link_libraries(your_target PRIVATE msgbus)
 ### 头文件
 
 ```cpp
-#include "msgbus/message_bus.h"
+#include "msgbus/message_bus.h"     // 核心（自动包含所有依赖头文件）
+#include "msgbus/topic_matcher.h"   // 仅需通配符匹配工具时单独引用
 ```
 
 ### 创建与启停
 
 ```cpp
-// 创建总线，可选指定队列容量（默认 65536）
+// 创建总线（默认：队列容量 65536，单 dispatcher）
 msgbus::MessageBus bus;
-msgbus::MessageBus bus(1048576);  // 100 万容量
+
+// 自定义队列容量
+msgbus::MessageBus bus(1048576);
+
+// 多 dispatcher 线程池（4 个 worker + 1 个 router）
+msgbus::MessageBus bus(65536, 4);
+
+// 自动检测 CPU 核心数
+msgbus::MessageBus bus(65536, 0);  // 0 = hardware_concurrency
 
 bus.start();  // 启动 dispatcher 线程
 bus.stop();   // 停止并排空队列（析构时自动调用）
@@ -91,12 +103,13 @@ bus.stop();   // 停止并排空队列（析构时自动调用）
 
 ```cpp
 // 发布任意类型消息到 topic，返回 false 表示队列已满
+// 内部自动使用对象池复用消息对象
 bool ok = bus.publish<int>("sensor/count", 42);
 bus.publish<std::string>("log/info", "system started");
 bus.publish<MyStruct>("data/update", {1, 3.14, "hello"});
 ```
 
-### 订阅消息
+### 订阅消息（精确匹配）
 
 ```cpp
 // 订阅 topic，返回订阅 ID（用于取消订阅）
@@ -110,10 +123,31 @@ auto id2 = bus.subscribe<int>("sensor/count", [](const int& value) {
 });
 ```
 
+### 订阅消息（通配符）
+
+```cpp
+// '*' 匹配单层
+auto id = bus.subscribe<int>("sensor/*/temp", [](const int& v) {
+    std::cout << "temp = " << v << "\n";
+});
+// 匹配: sensor/1/temp, sensor/abc/temp
+// 不匹配: sensor/1/2/temp
+
+// '#' 匹配零层或多层（必须为最后一段）
+auto id2 = bus.subscribe<std::string>("log/#", [](const std::string& msg) {
+    std::cout << "log: " << msg << "\n";
+});
+// 匹配: log, log/info, log/error/detail
+
+// 混合使用
+auto id3 = bus.subscribe<int>("sensor/*/data/#", [](const int& v) { ... });
+// 匹配: sensor/1/data, sensor/1/data/temp, sensor/abc/data/x/y
+```
+
 ### 取消订阅
 
 ```cpp
-bus.unsubscribe(id);
+bus.unsubscribe(id);  // 精确匹配和通配符订阅均可取消
 ```
 
 ### 协程等待
@@ -170,6 +204,41 @@ int main() {
 }
 ```
 
+### 通配符订阅
+
+```cpp
+msgbus::MessageBus bus;
+bus.start();
+
+// 订阅所有传感器数据
+bus.subscribe<double>("sensor/#", [](const double& v) {
+    std::cout << "any sensor: " << v << "\n";
+});
+
+// 订阅特定层级
+bus.subscribe<double>("sensor/*/temp", [](const double& v) {
+    std::cout << "temp: " << v << "\n";
+});
+
+bus.publish<double>("sensor/1/temp", 23.5);   // 两个 handler 都收到
+bus.publish<double>("sensor/1/humid", 67.8);  // 只有 # handler 收到
+```
+
+### 多 Dispatcher 线程池
+
+```cpp
+// 4 个 worker 线程，适合高负载多 topic 场景
+msgbus::MessageBus bus(65536, 4);
+bus.start();
+
+// 同一 topic 的消息保证顺序
+// 不同 topic 的消息可并行处理
+bus.subscribe<int>("topic/a", handler_a);
+bus.subscribe<int>("topic/b", handler_b);
+
+// topic/a 和 topic/b 可能在不同 worker 线程中并行处理
+```
+
 ### 多 Topic 解耦
 
 ```cpp
@@ -219,11 +288,12 @@ int main() {
 
 1. **类型安全**：同一 topic 只允许一种消息类型。对已有 topic 使用不同类型会抛出 `std::runtime_error`。
 2. **队列满**：`publish()` 在队列满时返回 `false`，调用者需重试或丢弃。
-3. **Handler 线程**：所有 handler 在 dispatcher 线程中执行。handler 应尽量轻量，避免阻塞。
+3. **Handler 线程**：单 dispatcher 模式下所有 handler 在一个线程中执行；多 dispatcher 模式下 handler 在 worker 线程中执行（同 topic 同 worker）。handler 应尽量轻量，避免阻塞。
 4. **Handler 异常**：单个 handler 抛异常不会影响其他订阅者，异常被静默捕获。
-5. **消息顺序**：同一 topic 的消息按 publish 顺序投递（单 dispatcher 线程保证）。
+5. **消息顺序**：同一 topic 的消息按 publish 顺序投递（单 dispatcher 直接保证；多 dispatcher 通过 hash 分片到同一 worker 保证）。
 6. **协程安全**：`async_wait` 是一次性等待，收到一条消息后自动取消订阅。
 7. **生命周期**：确保 `MessageBus` 的生命周期长于所有订阅者和协程。
+8. **通配符规则**：`*` 匹配恰好一层，`#` 匹配零层或多层且必须为 pattern 最后一段。
 
 ## 构建选项
 
