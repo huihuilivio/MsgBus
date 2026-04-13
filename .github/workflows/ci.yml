@@ -75,9 +75,40 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 30
 
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 lcov
+
+      - name: Configure with coverage
+        run: cmake -B build -S . -DCMAKE_CXX_STANDARD=20 -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 -DMSGBUS_COVERAGE=ON -DMSGBUS_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build -j $(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure --timeout 30
+
+      - name: Collect coverage
+        run: |
+          lcov --capture --directory build --output-file coverage.info --rc lcov_branch_coverage=1 --gcov-tool gcov-13
+          lcov --remove coverage.info '/usr/*' '*/googletest/*' '*/gtest/*' --output-file coverage.info --rc lcov_branch_coverage=1
+          lcov --list coverage.info --rc lcov_branch_coverage=1
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.info
+
   # Single status check for branch protection
   ci-passed:
-    needs: [build-windows, build-linux, build-macos]
+    needs: [build-windows, build-linux, build-macos, coverage]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -85,7 +116,8 @@ jobs:
         run: |
           if [ "${{ needs.build-windows.result }}" != "success" ] || \
              [ "${{ needs.build-linux.result }}" != "success" ] || \
-             [ "${{ needs.build-macos.result }}" != "success" ]; then
+             [ "${{ needs.build-macos.result }}" != "success" ] || \
+             [ "${{ needs.coverage.result }}" != "success" ]; then
             echo "One or more CI jobs failed"
             exit 1
           fi

@@ -17,6 +17,17 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(msgbus INTERFACE -fcoroutines)
 endif()
 
+# Code coverage (GCC/Clang only)
+option(MSGBUS_COVERAGE "Enable code coverage instrumentation" OFF)
+if(MSGBUS_COVERAGE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(msgbus INTERFACE --coverage -fprofile-arcs -ftest-coverage)
+        target_link_options(msgbus INTERFACE --coverage)
+    else()
+        message(WARNING "Code coverage is only supported with GCC/Clang")
+    endif()
+endif()
+
 # Examples
 option(MSGBUS_BUILD_EXAMPLES "Build examples" ON)
 if(MSGBUS_BUILD_EXAMPLES)
