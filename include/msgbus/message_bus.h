@@ -5,10 +5,14 @@
 #include "msgbus/object_pool.h"
 #include "msgbus/subscriber.h"
 #include "msgbus/topic_matcher.h"
+#include "msgbus/topic_registry.h"
 #include "msgbus/topic_slot.h"
+#include "msgbus/wildcard_trie.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <coroutine>
 #include <functional>
 #include <memory>
@@ -17,6 +21,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <typeinfo>
 #include <unordered_map>
@@ -30,7 +35,6 @@ inline constexpr size_t kDefaultQueueCapacity  = 65536;
 inline constexpr size_t kDefaultPoolCapacity    = 8192;
 inline constexpr unsigned kSpinThreshold        = 64;
 inline constexpr unsigned kYieldThreshold       = 256;
-inline constexpr unsigned kSleepMicroseconds    = 50;
 
 /// Per-type static object pool and recycler.
 template <typename T>
@@ -70,9 +74,13 @@ public:
             // Router is started FIRST so it can begin routing immediately.
             // Workers are joined AFTER router to ensure all routed messages are consumed.
             worker_queues_.reserve(num_dispatchers_);
+            worker_cvs_.reserve(num_dispatchers_);
+            worker_cv_mutexes_.reserve(num_dispatchers_);
             for (unsigned i = 0; i < num_dispatchers_; ++i) {
                 worker_queues_.push_back(
                     std::make_unique<LockFreeQueue<MessagePtr>>(queue_capacity_));
+                worker_cvs_.push_back(std::make_unique<std::condition_variable>());
+                worker_cv_mutexes_.push_back(std::make_unique<std::mutex>());
             }
             // Start router first (will be last in dispatchers_ vector)
             dispatchers_.emplace_back(&MessageBus::routerLoop, this);
@@ -85,6 +93,10 @@ public:
 
     void stop() {
         if (!running_.exchange(false)) return;
+        // Wake all sleeping threads
+        cv_.notify_all();
+        for (auto& wcv : worker_cvs_) wcv->notify_all();
+
         if (dispatchers_.size() > 1) {
             // Multi-dispatcher: join router first (dispatchers_[0]) so it
             // finishes draining the main queue into worker queues, THEN
@@ -102,74 +114,85 @@ public:
         }
         dispatchers_.clear();
         worker_queues_.clear();
+        worker_cvs_.clear();
+        worker_cv_mutexes_.clear();
         router_drained_.store(false, std::memory_order_relaxed);
     }
 
     /// Publish a message to a topic. Returns false if queue is full.
     template <typename T>
-    bool publish(const std::string& topic, T msg) {
+    bool publish(std::string_view topic, T msg) {
+        TopicId tid = registry_.resolve(topic);
         auto& pool = TypedMessagePool<T>::instance();
         TypedMessage<T>* raw = pool.acquire();
         if (raw) {
-            raw->reset(topic, std::move(msg));
+            raw->reset(tid, std::move(msg));
         } else {
-            raw = new TypedMessage<T>(topic, std::move(msg));
+            raw = new TypedMessage<T>(tid, std::move(msg));
         }
         raw->recycler_ = &TypedMessagePool<T>::recycle;
-        return queue_.try_enqueue(MessagePtr::adopt(raw));
+        bool ok = queue_.try_enqueue(MessagePtr::adopt(raw));
+        if (ok) cv_.notify_one();
+        return ok;
     }
 
     /// Subscribe to a topic (or wildcard pattern) with a handler.
     /// Wildcards: '*' matches one level, '#' matches zero or more trailing levels.
     /// Returns a subscription ID.
     template <typename T, typename Handler>
-    SubscriptionId subscribe(const std::string& topic, Handler&& handler) {
+    SubscriptionId subscribe(std::string_view topic, Handler&& handler) {
         auto id = next_id_.fetch_add(1, std::memory_order_relaxed) + 1;
 
         if (isWildcard(topic)) {
-            // Wildcard subscription: store pattern + slot
+            // Validate: '#' must be the last segment (MQTT rule)
+            auto pos = topic.find('#');
+            if (pos != std::string_view::npos &&
+                pos + 1 != topic.size()) {
+                throw std::runtime_error(
+                    "Invalid wildcard pattern: '#' must be the last segment");
+            }
+
+            // Wildcard subscription: insert into trie index
             auto slot = std::make_shared<TopicSlot<T>>();
             slot->addSubscriber(
                 std::function<void(const T&)>(std::forward<Handler>(handler)), id);
 
             std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
-            wildcard_entries_.push_back({topic, &typeid(T), slot, id});
+            wildcard_trie_.insert(topic, {&typeid(T), slot, id});
+
+            std::lock_guard<std::mutex> lk(sub_map_mutex_);
+            sub_to_topic_[id] = {kInvalidTopicId, true};
         } else {
-            auto* slot = getOrCreateSlot<T>(topic);
+            TopicId tid = registry_.resolve(topic);
+            auto* slot = getOrCreateSlot<T>(tid);
             slot->addSubscriber(
                 std::function<void(const T&)>(std::forward<Handler>(handler)), id);
-        }
 
-        std::lock_guard<std::mutex> lock(sub_map_mutex_);
-        sub_to_topic_[id] = topic;
+            std::lock_guard<std::mutex> lk(sub_map_mutex_);
+            sub_to_topic_[id] = {tid, false};
+        }
         return id;
     }
 
     /// Unsubscribe by subscription ID.
     void unsubscribe(SubscriptionId id) {
-        std::string topic;
+        SubInfo info;
         {
             std::lock_guard<std::mutex> lock(sub_map_mutex_);
             auto it = sub_to_topic_.find(id);
             if (it == sub_to_topic_.end()) return;
-            topic = it->second;
+            info = it->second;
             sub_to_topic_.erase(it);
         }
 
-        if (isWildcard(topic)) {
+        if (info.is_wildcard) {
             std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
-            for (auto it = wildcard_entries_.begin(); it != wildcard_entries_.end(); ++it) {
-                if (it->sub_id == id) {
-                    it->slot->removeSubscriber(id);
-                    wildcard_entries_.erase(it);
-                    break;
-                }
-            }
+            wildcard_trie_.remove(id);
         } else {
             ITopicSlot* slot = nullptr;
             {
                 std::shared_lock<std::shared_mutex> lock(slots_mutex_);
-                auto it = slots_.find(topic);
+                auto it = slots_.find(info.tid);
                 if (it != slots_.end()) {
                     slot = it->second.get();
                 }
@@ -225,55 +248,60 @@ public:
     };
 
     template <typename T>
-    AsyncWaitAwaitable<T> async_wait(const std::string& topic) {
-        return AsyncWaitAwaitable<T>(*this, topic);
+    AsyncWaitAwaitable<T> async_wait(std::string_view topic) {
+        return AsyncWaitAwaitable<T>(*this, std::string(topic));
     }
 
     /// Returns the number of dispatcher threads.
     unsigned dispatcher_count() const { return num_dispatchers_; }
 
+    /// Access the topic registry (e.g. to resolve TopicId ↔ string).
+    TopicRegistry& registry() { return registry_; }
+    const TopicRegistry& registry() const { return registry_; }
+
 private:
     template <typename T>
-    TopicSlot<T>* getOrCreateSlot(const std::string& topic) {
+    TopicSlot<T>* getOrCreateSlot(TopicId tid) {
         {
             std::shared_lock<std::shared_mutex> lock(slots_mutex_);
-            auto it = slots_.find(topic);
+            auto it = slots_.find(tid);
             if (it != slots_.end()) {
-                auto type_it = topic_types_.find(topic);
+                auto type_it = topic_types_.find(tid);
                 if (type_it != topic_types_.end() &&
                     *type_it->second != typeid(T)) {
                     throw std::runtime_error(
-                        "Type mismatch for topic: " + topic);
+                        "Type mismatch for topic: " + std::string(registry_.to_string(tid)));
                 }
                 return static_cast<TopicSlot<T>*>(it->second.get());
             }
         }
 
         std::unique_lock<std::shared_mutex> lock(slots_mutex_);
-        auto it = slots_.find(topic);
+        auto it = slots_.find(tid);
         if (it != slots_.end()) {
-            auto type_it = topic_types_.find(topic);
+            auto type_it = topic_types_.find(tid);
             if (type_it != topic_types_.end() &&
                 *type_it->second != typeid(T)) {
-                throw std::runtime_error("Type mismatch for topic: " + topic);
+                throw std::runtime_error("Type mismatch for topic: " + std::string(registry_.to_string(tid)));
             }
             return static_cast<TopicSlot<T>*>(it->second.get());
         }
 
         auto slot = std::make_unique<TopicSlot<T>>();
         auto* ptr = slot.get();
-        slots_[topic] = std::move(slot);
-        topic_types_[topic] = &typeid(T);
+        slots_[tid] = std::move(slot);
+        topic_types_[tid] = &typeid(T);
         return ptr;
     }
 
     void dispatchMessage(const MessagePtr& msg) {
-        // 1. Exact-match dispatch
+        TopicId tid = msg->topic_id();
+        // 1. Exact-match dispatch (integer hash lookup)
         {
             std::shared_lock<std::shared_mutex> lock(slots_mutex_);
-            auto it = slots_.find(msg->topic());
+            auto it = slots_.find(tid);
             if (it != slots_.end()) {
-                auto type_it = topic_types_.find(msg->topic());
+                auto type_it = topic_types_.find(tid);
                 if (type_it != topic_types_.end() &&
                     *type_it->second == msg->type()) {
                     it->second->dispatch(msg);
@@ -281,13 +309,16 @@ private:
             }
         }
 
-        // 2. Wildcard-match dispatch
+        // 2. Wildcard-match dispatch via trie (O(topic depth) instead of O(N))
         {
             std::shared_lock<std::shared_mutex> lock(wildcards_mutex_);
-            for (auto& entry : wildcard_entries_) {
-                if (*entry.type == msg->type() &&
-                    topicMatches(entry.pattern, msg->topic())) {
-                    entry.slot->dispatch(msg);
+            if (!wildcard_trie_.empty()) {
+                std::string_view topic_sv = registry_.to_string(tid);
+                thread_local std::vector<ITopicSlot*> matched;
+                matched.clear();
+                wildcard_trie_.match(topic_sv, msg->type(), matched);
+                for (auto* slot : matched) {
+                    slot->dispatch(msg);
                 }
             }
         }
@@ -308,8 +339,9 @@ private:
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(
-                        std::chrono::microseconds(kSleepMicroseconds));
+                    std::unique_lock<std::mutex> lk(cv_mutex_);
+                    cv_.wait_for(lk, std::chrono::milliseconds(1),
+                        [this] { return !running_.load(std::memory_order_relaxed); });
                 }
             }
         }
@@ -325,13 +357,12 @@ private:
     /// Router thread: dequeue from main queue, hash-route to worker queues.
     /// Messages with the same topic always go to the same worker (ordering guarantee).
     void routerLoop() {
-        std::hash<std::string> hasher;
         unsigned idle = 0;
         while (running_.load(std::memory_order_relaxed)) {
             MessagePtr msg;
             if (queue_.try_dequeue(msg)) {
                 idle = 0;
-                routeToWorker(hasher, msg);
+                routeToWorker(msg);
             } else {
                 if (idle < kSpinThreshold) {
                     ++idle;
@@ -339,8 +370,9 @@ private:
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(
-                        std::chrono::microseconds(kSleepMicroseconds));
+                    std::unique_lock<std::mutex> lk(cv_mutex_);
+                    cv_.wait_for(lk, std::chrono::milliseconds(1),
+                        [this] { return !running_.load(std::memory_order_relaxed); });
                 }
             }
         }
@@ -348,20 +380,23 @@ private:
         // Workers are still alive (stop() joins router before workers).
         MessagePtr msg;
         while (queue_.try_dequeue(msg)) {
-            routeToWorker(hasher, msg);
+            routeToWorker(msg);
         }
     }
 
-    void routeToWorker(std::hash<std::string>& hasher, const MessagePtr& msg) {
-        size_t idx = hasher(msg->topic()) % num_dispatchers_;
+    void routeToWorker(const MessagePtr& msg) {
+        size_t idx = std::hash<TopicId>{}(msg->topic_id()) % num_dispatchers_;
         while (!worker_queues_[idx]->try_enqueue(msg)) {
             std::this_thread::yield();
         }
+        worker_cvs_[idx]->notify_one();
     }
 
     /// Worker thread: dequeue from its own queue and dispatch.
     void workerLoop(unsigned worker_id) {
         auto& wq = *worker_queues_[worker_id];
+        auto& wcv = *worker_cvs_[worker_id];
+        auto& wcv_mu = *worker_cv_mutexes_[worker_id];
         unsigned idle = 0;
         while (running_.load(std::memory_order_relaxed)) {
             MessagePtr msg;
@@ -375,8 +410,9 @@ private:
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(
-                        std::chrono::microseconds(kSleepMicroseconds));
+                    std::unique_lock<std::mutex> lk(wcv_mu);
+                    wcv.wait_for(lk, std::chrono::milliseconds(1),
+                        [this] { return !running_.load(std::memory_order_relaxed); });
                 }
             }
         }
@@ -404,28 +440,33 @@ private:
 
     // Multi-dispatcher worker queues (one per worker)
     std::vector<std::unique_ptr<LockFreeQueue<MessagePtr>>> worker_queues_;
+    std::vector<std::unique_ptr<std::condition_variable>> worker_cvs_;
+    std::vector<std::unique_ptr<std::mutex>> worker_cv_mutexes_;
     std::vector<std::thread> dispatchers_;
 
-    // Exact-match slots
+    // Exact-match slots (keyed by TopicId for O(1) integer hash)
     std::shared_mutex slots_mutex_;
-    std::unordered_map<std::string, std::unique_ptr<ITopicSlot>> slots_;
-    std::unordered_map<std::string, const std::type_info*> topic_types_;
+    std::unordered_map<TopicId, std::unique_ptr<ITopicSlot>> slots_;
+    std::unordered_map<TopicId, const std::type_info*> topic_types_;
 
-    // Wildcard subscriptions
-    struct WildcardEntry {
-        std::string pattern;
-        const std::type_info* type;
-        std::shared_ptr<ITopicSlot> slot;
-        SubscriptionId sub_id;
-    };
+    // Wildcard subscriptions (trie-indexed)
     std::shared_mutex wildcards_mutex_;
-    std::vector<WildcardEntry> wildcard_entries_;
+    WildcardTrie wildcard_trie_;
 
+    struct SubInfo {
+        TopicId tid;
+        bool is_wildcard;
+    };
     std::mutex sub_map_mutex_;
-    std::unordered_map<SubscriptionId, std::string> sub_to_topic_;
+    std::unordered_map<SubscriptionId, SubInfo> sub_to_topic_;
 
     std::atomic<SubscriptionId> next_id_{0};
     std::atomic<bool> running_{false};
+    TopicRegistry registry_;
+
+    // Condition variable for dispatch/router threads (replaces sleep backoff)
+    std::mutex cv_mutex_;
+    std::condition_variable cv_;
 };
 
 } // namespace msgbus

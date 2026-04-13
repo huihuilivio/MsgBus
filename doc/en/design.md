@@ -51,7 +51,7 @@ Implement a **single-process, high-performance, lock-free (or minimal-lock), cor
                 │                  ▼  Route by topic                       │
                 │  ┌────────────────────────────────────────┐              │
                 │  │  ① Exact match: TopicSlot<T> (COW list) │              │
-                │  │  ② Wildcard match: WildcardEntry list   │              │
+                │  │  ② Wildcard match: WildcardTrie index   │              │
                 │  │     '*' one level / '#' multi-level     │              │
                 │  │  ┌────────┐ ┌────────┐ ┌───────┐      │              │
                 │  │  │ Sub 1  │ │ Sub 2  │ │Sub N  │      │              │
@@ -94,8 +94,10 @@ MsgBus/
 │       ├── object_pool.h              # Lock-free object pool (freelist recycling)
 │       ├── subscriber.h               # Subscriber<T> definition
 │       ├── topic_matcher.h            # MQTT-style topic wildcard matching
+│       ├── topic_registry.h           # TopicId ↔ string thread-safe registry
 │       ├── topic_slot.h               # TopicSlot<T> COW subscription management
-│       └── message_bus.h              # MessageBus core + pool + multi-dispatcher + wildcards + coroutines
+│       ├── wildcard_trie.h            # Wildcard trie index (O(depth) matching)
+│       └── message_bus.h              # MessageBus core + pool + multi-dispatcher + wildcards + coroutines + TopicRegistry
 ├── examples/
 │   ├── CMakeLists.txt
 │   ├── basic_example.cpp              # Basic pub/sub example
@@ -103,8 +105,8 @@ MsgBus/
 │   └── wildcard_example.cpp           # Wildcard subscription example
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # Unit tests (55 GTest cases)
-│   └── bench_message_bus.cpp           # Benchmarks (6 scenarios)
+│   ├── test_message_bus.cpp            # Unit tests (73 GTest cases)
+│   └── bench_message_bus.cpp           # Benchmarks (8 scenarios)
 └── .github/
     └── workflows/
         ├── ci.yml                      # CI: UT on push/PR (Windows/Linux/macOS)
@@ -174,11 +176,15 @@ public:
 **File**: `include/msgbus/message.h`
 
 ```cpp
+/// Compact topic identifier — replaces std::string on the hot path.
+using TopicId = uint32_t;
+inline constexpr TopicId kInvalidTopicId = 0;
+
 struct IMessage {
     std::atomic<int> ref_count_{0};         // Intrusive reference count
     void (*recycler_)(IMessage*) = nullptr; // Recycle function pointer
 
-    virtual const std::string& topic();
+    virtual TopicId topic_id();
     virtual const std::type_info& type();
     void add_ref() noexcept;
     bool release_ref() noexcept;            // Returns true when count reaches zero
@@ -186,9 +192,9 @@ struct IMessage {
 
 template <typename T>
 struct TypedMessage : IMessage {
-    std::string topic_;
+    TopicId topic_id_;
     T data_;
-    void reset(const std::string& topic, T data); // Reset for pool reuse
+    void reset(TopicId topic_id, T data); // Reset for pool reuse (integer assign instead of string copy)
 };
 ```
 
@@ -207,8 +213,8 @@ public:
 
 * **Replaces `shared_ptr`**: Eliminates separate control block heap allocation; ref count embedded in IMessage
 * **Recycler function pointer**: Set during publish; called when ref count reaches zero to return object to pool instead of delete
-* **`reset()` method**: Resets topic/data/ref_count/recycler for pool reuse, avoiding destruct+construct overhead
-* Performance gain: Minimum latency from ~36μs down to ~0.3μs
+* **`reset()` method**: Resets topic_id/data/ref_count/recycler for pool reuse, integer assign instead of string copy
+* Performance gain: Minimum latency from ~36μs down to ~0.6μs
 
 ---
 
@@ -222,7 +228,6 @@ inline constexpr size_t kDefaultQueueCapacity  = 65536;
 inline constexpr size_t kDefaultPoolCapacity    = 8192;
 inline constexpr unsigned kSpinThreshold        = 64;
 inline constexpr unsigned kYieldThreshold       = 256;
-inline constexpr unsigned kSleepMicroseconds    = 50;
 
 template <typename T>
 struct TypedMessagePool {
@@ -235,10 +240,11 @@ struct TypedMessagePool {
 
 ```
 publish<T>(topic, msg)
+  → registry_.resolve(topic) → TopicId  // string→integer (shared_lock fast path)
   → pool.acquire()
-  → hit:  reset(topic, msg)    // Reuse, no heap allocation
-  → miss: new TypedMessage<T>  // First-time creation
-  → raw->recycler_ = &recycle  // Set recycle callback
+  → hit:  reset(topic_id, msg)    // Reuse, integer assign, no heap allocation
+  → miss: new TypedMessage<T>     // First-time creation
+  → raw->recycler_ = &recycle     // Set recycle callback
   → queue_.try_enqueue(MessagePtr::adopt(raw))
 ```
 
@@ -254,7 +260,38 @@ MessagePtr ref count reaches zero
 
 ---
 
-### 4.5 TopicMatcher — MQTT-Style Wildcards
+### 4.5 TopicRegistry — Topic String ↔ ID Registry
+
+**File**: `include/msgbus/topic_registry.h`
+
+Thread-safe bidirectional mapping between topic strings and integer IDs. All hot paths (dispatch, route) use `TopicId` (`uint32_t`) instead of `std::string` for hashing and comparison.
+
+```cpp
+class TopicRegistry {
+public:
+    TopicId resolve(std::string_view topic);      // Register or look up topic → stable ID
+    std::string_view to_string(TopicId id) const; // Reverse lookup ID → string (e.g. for wildcard matching)
+};
+```
+
+**Key Design**:
+
+| Feature | Implementation |
+|---|---|
+| Read path | `shared_lock` + transparent hash lookup (`string_view` into `string` keys, zero allocation) |
+| Write path | `unique_lock` + double-check, only triggered on first registration |
+| ID stability | Monotonically incrementing, `kInvalidTopicId = 0`, valid IDs start from 1 |
+| String lifetime | `id_to_sv_` stores `string_view` pointing into `unordered_map` keys (iterator stability guarantee) |
+
+**Benefits**:
+* dispatch path `slots_` and `topic_types_` changed from `unordered_map<string, ...>` to `unordered_map<uint32_t, ...>`
+* Routing via `hash<TopicId>` instead of `hash<string>` in `routeToWorker`
+* `TypedMessage<T>` carries only 4-byte `TopicId` instead of `std::string`
+* Multi-topic QPS improved ~26%, p50 latency reduced ~6x
+
+---
+
+### 4.6 TopicMatcher — MQTT-Style Wildcards
 
 **File**: `include/msgbus/topic_matcher.h`
 
@@ -277,7 +314,49 @@ bool isWildcard(std::string_view pattern);
 
 ---
 
-### 4.6 TopicSlot — COW Subscription Management
+### 4.7 WildcardTrie — Wildcard Trie Index
+
+**File**: `include/msgbus/wildcard_trie.h`
+
+Builds a trie from wildcard subscription patterns indexed by topic levels. On dispatch, the trie is walked with the concrete topic's levels, achieving **O(topic depth)** complexity instead of O(N).
+
+```cpp
+class WildcardTrie {
+public:
+    void insert(std::string_view pattern,  // Insert wildcard pattern
+               const Entry& entry);
+    bool remove(SubscriptionId id);        // Remove by ID (auto-prunes empty nodes)
+    void match(std::string_view topic,     // Find matching slots
+               const std::type_info& type,
+               std::vector<ITopicSlot*>& out) const;
+    bool empty() const;                    // O(1) entry counter
+};
+```
+
+**Matching Algorithm**:
+
+```
+matchNode(node, levels, depth):
+  1. Check node's '#' child → matches all remaining levels (terminal)
+  2. depth == levels.size() → check entries at current node
+  3. Check exact-match child levels[depth] → recurse depth+1
+  4. Check '*' child → recurse depth+1 (skip one level)
+```
+
+**Key Design**:
+
+| Feature | Implementation |
+|---|---|
+| Complexity | O(topic depth), independent of pattern count |
+| Scalability | 100 patterns vs 1000 patterns: same QPS (~1.6M) |
+| Thread safety | External shared_mutex protection (read-write separation) |
+| Memory | `unordered_map<string, unique_ptr<Node>>` tree structure, auto-prunes empty nodes on remove |
+| Zero-alloc lookup | Transparent hash (`SVHash`/`SVEqual`), `find(string_view)` avoids temporary `std::string` |
+| `empty()` | O(1) `entry_count_` counter, not recursive traversal |
+
+---
+
+### 4.8 TopicSlot — COW Subscription Management
 
 **File**: `include/msgbus/topic_slot.h`
 
@@ -312,7 +391,7 @@ dispatch:
 
 ---
 
-### 4.7 MessageBus — Core Bus
+### 4.9 MessageBus — Core Bus
 
 **File**: `include/msgbus/message_bus.h`
 
@@ -327,15 +406,15 @@ public:
     void stop();    // Stop and drain queue
 
     template <typename T>
-    bool publish(const std::string& topic, T msg);          // Publish (pool + lock-free enqueue)
+    bool publish(std::string_view topic, T msg);          // Publish (pool + lock-free enqueue)
 
     template <typename T, typename Handler>
-    SubscriptionId subscribe(const std::string& topic, Handler&& handler); // Supports wildcards
+    SubscriptionId subscribe(std::string_view topic, Handler&& handler); // Supports wildcards
 
     void unsubscribe(SubscriptionId id);
 
     template <typename T>
-    AsyncWaitAwaitable<T> async_wait(const std::string& topic); // Coroutine await
+    AsyncWaitAwaitable<T> async_wait(std::string_view topic); // Coroutine await
 
     unsigned dispatcher_count() const;  // Returns dispatcher thread count
 };
@@ -350,9 +429,9 @@ public:
 **Message Dispatch (dispatchMessage)**:
 
 ```
-1. Exact match: slots_[topic] → TopicSlot<T>::dispatch()
-2. Wildcard match: iterate wildcard_entries_, topicMatches(pattern, topic)
-   → Matched WildcardEntry::slot->dispatch()
+1. Exact match: slots_[topic_id] → TopicSlot<T>::dispatch() (integer hash lookup)
+2. Wildcard match: registry_.to_string(topic_id) → WildcardTrie::match()
+   → O(topic depth) trie traversal, returns matching slot list
 ```
 
 **Single-Thread Dispatcher (num_dispatchers == 1)**:
@@ -361,7 +440,7 @@ public:
 dispatchLoop():
   idle count < kSpinThreshold(64)   → spin (lowest latency)
   idle count < kYieldThreshold(256) → yield (give up CPU)
-  idle count ≥ kYieldThreshold      → sleep kSleepMicroseconds(50)μs (save CPU)
+  idle count ≥ kYieldThreshold      → condition_variable wait (woken by publish notify)
   message arrives                   → immediately reset count, back to spin
 ```
 
@@ -371,7 +450,7 @@ dispatchLoop():
 Architecture: 1 Router thread + N Worker threads
 
 Router thread (routerLoop):
-  Dequeue from main queue → hash(topic) % N → enqueue to worker_queues_[N]
+  Dequeue from main queue → hash(topic_id) % N → enqueue to worker_queues_[N]
   Same topic always routes to same worker (ordering guarantee)
 
 Worker thread (workerLoop):
@@ -379,7 +458,7 @@ Worker thread (workerLoop):
   Each worker has independent backoff strategy
 ```
 
-**Ordering Guarantee**: Messages on the same topic are hash-sharded to the same worker, guaranteeing in-order delivery within that topic.
+**Ordering Guarantee**: Messages on the same topic are hash-sharded via hash(topic_id) to the same worker, guaranteeing in-order delivery within that topic.
 
 **Graceful Shutdown** (safe sequence):
 
@@ -396,7 +475,7 @@ Workers enter a wait loop after `running_=false`, only doing final drain and exi
 
 ---
 
-### 4.8 AsyncWaitAwaitable — Coroutine Support
+### 4.10 AsyncWaitAwaitable — Coroutine Support
 
 ```cpp
 template <typename T>
@@ -431,14 +510,15 @@ co_await bus.async_wait<T>(topic)
 
 | Operation | Lock Level | Notes |
 |---|---|---|
-| `publish` | **Fully lock-free** | Pool acquire + atomic CAS enqueue |
+| `publish` | shared_lock | TopicRegistry resolve + pool acquire + atomic CAS enqueue |
 | `subscribe` (exact) | mutex (COW) | Low-frequency, copies entire list |
 | `subscribe` (wildcard) | shared_mutex write lock | Append WildcardEntry |
 | `unsubscribe` | mutex / shared_mutex | Same as above |
-| `dispatch` (exact) | **Read lock-free** | Only shared_ptr copy under lock; iteration lock-free |
-| `dispatch` (wildcard) | shared_mutex read lock | Iterate wildcard_entries_ for matching |
-| Topic lookup | shared_mutex read lock | Hash table lookup, read-heavy |
-| Router routing | **Fully lock-free** | hash + CAS into worker queue |
+| `dispatch` (exact) | **Read lock-free** | TopicId integer hash lookup; only shared_ptr copy under lock; iteration lock-free |
+| `dispatch` (wildcard) | shared_mutex read lock | Trie traversal O(depth), independent of pattern count |
+| Topic lookup | shared_mutex read lock | TopicId integer-key hash table lookup, read-heavy |
+| TopicRegistry resolve | shared_lock / unique_lock | Already registered: shared_lock only; first registration: unique_lock |
+| Router routing | **Fully lock-free** | hash(TopicId) + CAS into worker queue |
 
 ### 5.2 Memory Management
 
@@ -453,6 +533,7 @@ co_await bus.async_wait<T>(topic)
 * `IMessage` + `typeid` runtime verification
 * One type per topic prevents `static_cast` errors
 * Wildcard subscriptions also perform type checks, skipping type-mismatched messages
+* Wildcard format validation: `#` must be the last segment, otherwise throws `std::runtime_error`
 
 ---
 
@@ -462,8 +543,8 @@ co_await bus.async_wait<T>(topic)
 
 | Path | Complexity | Lock | Optimization |
 |---|---|---|---|
-| publish → pool acquire → enqueue | O(1) | Lock-free | Object pool avoids heap allocation |
-| dequeue → dispatch | O(subscribers + wildcards) | Read lock-free / read lock | COW snapshot |
+| publish → registry resolve → pool acquire → enqueue | O(1) | shared_lock + lock-free | TopicId integer assign + object pool avoids heap allocation |
+| dequeue → dispatch | O(subscribers + wildcards) | Read lock-free / read lock | TopicId integer hash + COW snapshot |
 | subscribe | O(n) copy | mutex | Low-frequency, COW |
 
 ### Cache Friendliness
@@ -477,6 +558,9 @@ co_await bus.async_wait<T>(topic)
 * Intrusive ref counting: eliminates `shared_ptr` separate control block heap allocation
 * Object pool + `reset()`: message object reuse avoids construct/destruct overhead
 * Recycler function pointer: zero virtual function overhead recycle path
+* TopicId integer routing: dispatch/route paths use `uint32_t` instead of `std::string` hash/compare
+* Wildcard trie index: O(topic depth) matching replaces O(N) linear scan
+* Condition variable backoff: replaces sleep, idle threads woken quickly by publish notify
 
 ---
 
@@ -487,6 +571,9 @@ co_await bus.async_wait<T>(topic)
 | ~~Multi-thread dispatcher~~ | ~~P2~~ | ✅ Done | Topic hash sharding to thread pool |
 | ~~Zero-copy optimization~~ | ~~P3~~ | ✅ Done | Object pool + intrusive ref count |
 | ~~Topic wildcards~~ | ~~P3~~ | ✅ Done | MQTT-style `*` / `#` |
+| ~~TopicId integer routing~~ | ~~P2~~ | ✅ Done | TopicRegistry + uint32_t replaces string, multi-topic +86% |
+| ~~Wildcard trie index~~ | ~~P2~~ | ✅ Done | O(depth) matching, independent of pattern count |
+| ~~Condition variable backoff~~ | ~~P2~~ | ✅ Done | Replaces sleep, p50 latency ~7x |
 | Backpressure | P2 | Planned | Rate limiting strategy when publish returns false |
 | Batch consumption | P2 | Planned | Dequeue multiple at once, reduce scheduling overhead |
 | Priority queue | P3 | Planned | Message priorities |
@@ -512,6 +599,29 @@ co_await bus.async_wait<T>(topic)
 - [x] Publish path object reuse (acquire → reset → enqueue)
 - [x] Automatic pool recycling on ref count zero
 
+### TopicId Integer Routing
+- [x] TopicRegistry (thread-safe bidirectional mapping, shared_mutex read-write separation)
+- [x] IMessage::topic_id() replaces topic(), TypedMessage carries uint32_t
+- [x] slots_ / topic_types_ keyed by TopicId (integer hash)
+- [x] routeToWorker uses hash(TopicId) routing
+- [x] Wildcard unsubscribe without string reverse lookup (SubInfo flag distinction)
+
+### Wildcard Trie Index
+- [x] WildcardTrie (trie built from topic levels)
+- [x] Matching complexity O(depth), independent of pattern count
+- [x] Replaces wildcard_entries_ linear scan
+- [x] WildcardTrie unit tests (10 cases)
+- [x] Transparent hash (`SVHash`/`SVEqual`) for zero-allocation `find(string_view)`
+- [x] O(1) `entry_count_` replaces recursive `isEmpty()` traversal
+- [x] `remove()` auto-prunes empty trie nodes (prevents memory leak)
+- [x] `insert()` accepts `string_view pattern` parameter, Entry no longer stores redundant pattern string
+
+### Condition Variable Backoff
+- [x] dispatch/router/worker threads use condition_variable instead of sleep
+- [x] publish notifies dispatcher via notify_one
+- [x] routeToWorker notifies corresponding worker
+- [x] stop() wakes all threads via notify_all
+
 ### Multi-Dispatcher
 - [x] Router thread (hash sharding)
 - [x] Worker thread pool (independent backoff)
@@ -524,6 +634,10 @@ co_await bus.async_wait<T>(topic)
 - [x] subscribe auto-detects wildcard vs. exact
 - [x] dispatchMessage: exact first, then wildcard
 - [x] unsubscribe wildcard cleanup
+- [x] Wildcard format validation (`#` must be last segment, throws on violation)
+
+### API Optimization
+- [x] `publish()`/`subscribe()`/`async_wait()` topic parameter changed from `const std::string&` to `std::string_view`
 
 ### Dispatch Logic
 - [x] Dispatcher thread (3-tier backoff)
@@ -545,9 +659,9 @@ co_await bus.async_wait<T>(topic)
 - [ ] Metrics (queue depth, latency)
 
 ### Engineering
-- [x] Unit tests (55 GTest cases)
+- [x] Unit tests (73 GTest cases)
 - [x] Code coverage (OpenCppCoverage / lcov, 96.1%)
-- [x] Benchmarks (6 scenarios)
+- [x] Benchmarks (8 scenarios)
 - [x] GitHub Actions CI (Windows/Linux/macOS, UT gate)
 - [x] Release workflow (tag pre-release + benchmarks + source archive)
 - [x] Documentation (design doc + usage doc + benchmark doc)

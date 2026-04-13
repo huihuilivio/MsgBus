@@ -1,11 +1,15 @@
 #pragma once
 
 #include <atomic>
-#include <string>
+#include <cstdint>
 #include <typeinfo>
 #include <utility>
 
 namespace msgbus {
+
+/// Compact topic identifier — replaces std::string on the hot path.
+using TopicId = uint32_t;
+inline constexpr TopicId kInvalidTopicId = 0;
 
 /// Base message with intrusive reference count (replaces shared_ptr overhead).
 struct IMessage {
@@ -13,7 +17,7 @@ struct IMessage {
     void (*recycler_)(IMessage*) = nullptr;
 
     virtual ~IMessage() = default;
-    virtual const std::string& topic() const = 0;
+    virtual TopicId topic_id() const = 0;
     virtual const std::type_info& type() const = 0;
 
     void add_ref() noexcept {
@@ -28,21 +32,21 @@ struct IMessage {
 
 template <typename T>
 struct TypedMessage : IMessage {
-    std::string topic_;
+    TopicId topic_id_;
     T data_;
 
-    TypedMessage(std::string topic, T data)
-        : topic_(std::move(topic)), data_(std::move(data)) {}
+    TypedMessage(TopicId topic_id, T data)
+        : topic_id_(topic_id), data_(std::move(data)) {}
 
-    /// Reset a pooled object for reuse (avoids new allocation).
-    void reset(const std::string& topic, T data) {
+    /// Reset a pooled object for reuse (integer assign instead of string copy).
+    void reset(TopicId topic_id, T data) {
         ref_count_.store(0, std::memory_order_relaxed);
         recycler_ = nullptr;
-        topic_ = topic;
+        topic_id_ = topic_id;
         data_ = std::move(data);
     }
 
-    const std::string& topic() const override { return topic_; }
+    TopicId topic_id() const override { return topic_id_; }
     const std::type_info& type() const override { return typeid(T); }
 };
 

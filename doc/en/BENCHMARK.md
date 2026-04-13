@@ -38,7 +38,7 @@ cmake --build build --config Release
 - **Compiler**: MSVC 19.42 (Visual Studio 2022)
 - **Build Config**: Release (`/O2`)
 - **C++ Standard**: C++20
-- **Optimization**: Object pool + intrusive reference counting (replaces shared_ptr)
+- **Optimization**: Object pool + intrusive reference counting + TopicId integer routing + Wildcard trie index + condition variable backoff
 
 ---
 
@@ -53,8 +53,8 @@ cmake --build build --config Release
 | Metric | Result |
 |---|---|
 | Messages | 1,000,000 |
-| Duration | ~90 ms |
-| Throughput | **~11,000,000 ops/s** |
+| Duration | ~14 ms |
+| Throughput | **~71,000,000 ops/s** |
 
 ---
 
@@ -65,13 +65,14 @@ cmake --build build --config Release
 | Metric | Result |
 |---|---|
 | Messages | 1,000,000 |
-| Duration | ~150 ms |
-| Throughput | **~6,700,000 QPS** |
+| Duration | ~210 ms |
+| Throughput | **~4,700,000 QPS** |
 
 **Analysis**: Overhead vs. Raw Queue mainly comes from:
 - Object pool acquire/release (lock-free, minimal)
 - `TypedMessage<T>` construction or reset
-- Topic hash lookup + shared_mutex read lock
+- TopicRegistry resolve (shared_lock + hash lookup)
+- Topic integer-key hash lookup + shared_mutex read lock
 - `std::function` call overhead
 - Intrusive reference counting atomic operations
 
@@ -88,8 +89,8 @@ cmake --build build --config Release
 | Threads | 4 |
 | Messages per thread | 250,000 |
 | Total messages | 1,000,000 |
-| Duration | ~184 ms |
-| Throughput | **~5,440,000 QPS** |
+| Duration | ~230 ms |
+| Throughput | **~4,400,000 QPS** |
 
 **Analysis**: ~20% throughput drop from multi-thread CAS contention, as expected. The Vyukov algorithm maintains good performance under multi-producer load.
 
@@ -99,21 +100,20 @@ cmake --build build --config Release
 
 **Scenario**: 1 publisher, 1 subscriber, measuring per-message latency from publish to handler execution. Includes 1,000 warm-up messages.
 
-| Percentile | After Optimization (μs) | Before Optimization (μs) |
-|---|---|---|
-| **min** | **0.3** | 36.2 |
-| **p50** | 2,196 | 3,582.7 |
-| **p90** | 4,977.8 | 4,977.8 |
-| **p99** | 5,796.2 | 5,796.2 |
-| **max** | 5,910.4 | 5,910.4 |
+| Percentile | Current (μs) | After TopicId (μs) | After Object Pool (μs) | Before Optimization (μs) |
+|---|---|---|---|---|
+| **min** | **0.2** | 0.6 | 0.3 | 36.2 |
+| **p50** | **57** | 374 | 2,196 | 3,582.7 |
+| **p90** | **114** | 480 | 4,977.8 | 4,977.8 |
+| **p99** | **250** | 773 | 5,796.2 | 5,796.2 |
+| **max** | **358** | 895 | 5,910.4 | 5,910.4 |
 
 **Analysis**:
 
-- **Minimum latency dropped from ~36μs to ~0.3μs** (100x improvement), thanks to object pool reuse eliminating heap allocation + intrusive ref counting eliminating shared_ptr control block overhead
-- p50 dropped from ~3.6ms to ~2.2ms (~40% improvement), median latency also significantly benefits
-- High percentile latencies are dominated by queuing effects (100K messages published back-to-back), object pool optimization has less impact
+- **Minimum latency ~0.2μs**, thanks to object pool reuse eliminating heap allocation + intrusive ref counting
+- **p50 dropped from ~374μs to ~57μs** (~7x improvement), condition variable replacing sleep backoff significantly reduces tail latency
+- p90/p99 also significantly reduced (p99: 773μs → 250μs), idle threads are quickly woken by condvar
 - In real-world usage (lower publish frequency), latency will approach the min value
-- The 3-tier backoff strategy increases latency when idle but significantly reduces CPU usage
 
 ---
 
@@ -121,14 +121,14 @@ cmake --build build --config Release
 
 **Scenario**: 100 different topics, 10,000 messages per topic.
 
-| Metric | After Optimization | Before Optimization |
-|---|---|---|
-| Topics | 100 | 100 |
-| Total messages | 1,000,000 | 1,000,000 |
-| Duration | ~172 ms | ~202 ms |
-| Throughput | **~5,800,000 QPS** | ~4,950,000 QPS |
+| Metric | Current (TopicId) | After Object Pool | Before Optimization |
+|---|---|---|---|
+| Topics | 100 | 100 | 100 |
+| Total messages | 1,000,000 | 1,000,000 | 1,000,000 |
+| Duration | ~110 ms | ~172 ms | ~202 ms |
+| Throughput | **~9,200,000 QPS** | ~5,800,000 QPS | ~4,950,000 QPS |
 
-**Analysis**: Object pool optimization shows significant gains in multi-topic scenarios (**+18% QPS**), because topic switching causes more message object creation/destruction, amplifying pool reuse benefits.
+**Analysis**: Multi-topic QPS reaches **~9.2M**, a cumulative **+86%** improvement over the original shared_ptr version. TopicId integer hash lookup and condvar wakeup both contribute.
 
 ---
 
@@ -143,8 +143,8 @@ cmake --build build --config Release
 | Messages | 100,000 |
 | Subscribers | 10 |
 | Total deliveries | 1,000,000 |
-| Duration | ~32 ms |
-| Delivery rate | **~31,170,000 deliveries/s** |
+| Duration | ~33 ms |
+| Delivery rate | **~30,000,000 deliveries/s** |
 
 #### 100 Subscribers
 
@@ -153,8 +153,8 @@ cmake --build build --config Release
 | Messages | 10,000 |
 | Subscribers | 100 |
 | Total deliveries | 1,000,000 |
-| Duration | ~12 ms |
-| Delivery rate | **~84,050,000 deliveries/s** |
+| Duration | ~11 ms |
+| Delivery rate | **~88,000,000 deliveries/s** |
 
 **Analysis**: Delivery rate actually increases in fan-out scenarios because:
 - Per-message dequeue + topic lookup overhead is amortized across multiple handler calls
@@ -164,18 +164,34 @@ cmake --build build --config Release
 
 ---
 
+### 7. Wildcard — Wildcard Matching Throughput
+
+**Scenario**: N wildcard patterns, publish to a topic matching 1 of the patterns.
+
+| Metric | 100 patterns | 1000 patterns |
+|---|---|---|
+| Messages | 100,000 | 100,000 |
+| Duration | ~62 ms | ~62 ms |
+| Throughput | **~1,600,000 QPS** | **~1,600,000 QPS** |
+
+**Analysis**: Core advantage of the trie index: **matching complexity is O(topic depth), independent of pattern count**. 100 patterns and 1000 patterns achieve essentially the same QPS, whereas a linear scan would drop to 1/10 throughput at 1000 patterns.
+
+---
+
 ## Performance Summary
 
 | Scenario | QPS / Rate | Notes |
 |---|---|---|
-| Raw Queue | ~11M ops/s | Queue theoretical max throughput |
-| Single pub/sub | ~6.7M QPS | Full end-to-end path |
-| 4 producers | ~5.4M QPS | MPMC concurrent |
-| 100 topics | **~5.8M QPS** | Hash routing (object pool +18%) |
-| Fan-out ×10 | ~31M del/s | Broadcast delivery |
-| Fan-out ×100 | ~84M del/s | High fan-out delivery |
-| Latency min | **~0.3 μs** | Object pool reuse (was 36μs) |
-| Latency p50 | **~2.2 ms** | Queuing effect dominated (was 3.6ms) |
+| Raw Queue | ~71M ops/s | Queue theoretical max throughput |
+| Single pub/sub | ~4.7M QPS | Full end-to-end path |
+| 4 producers | ~4.4M QPS | MPMC concurrent |
+| 100 topics | **~9.2M QPS** | TopicId + condvar (+86%) |
+| Fan-out ×10 | ~30M del/s | Broadcast delivery |
+| Fan-out ×100 | ~88M del/s | High fan-out delivery |
+| Wildcard ×100 | ~1.6M QPS | Trie index |
+| Wildcard ×1000 | ~1.6M QPS | O(depth), independent of pattern count |
+| Latency min | **~0.2 μs** | Object pool reuse |
+| Latency p50 | **~57 μs** | Condvar wakeup (was ~374μs) |
 
 > Above are local Windows reference numbers. Per-platform release data is available on the [Releases](../../releases) page.
 
@@ -191,14 +207,16 @@ cmake --build build --config Release
 | Memory allocation | `new TypedMessage` + control block per message | Object pool acquire/release, zero allocation on pool hit |
 | Recycling | `shared_ptr` destructor → `delete` | Recycler function pointer → object pool recycle & reuse |
 | Reference counting | Separate control block atomic ops | Embedded `atomic<int>` in IMessage |
+| Topic routing key | `std::string` hash/compare | `uint32_t` TopicId integer hash |
+| Topic storage | `std::string` per message | `uint32_t` per message |
 
 ### Impact
 
 | Metric | Improvement |
 |---|---|
-| Min latency | 36μs → 0.3μs (**~100x**) |
-| p50 latency | 3.6ms → 2.2ms (**~40%**) |
-| Multi-topic QPS | 4.95M → 5.8M (**+18%**) |
+| Min latency | 36μs → 0.2μs (**~180x**) |
+| p50 latency | 3.6ms → 57μs (**~63x**) |
+| Multi-topic QPS | 4.95M → 9.2M (**+86%**) |
 
 ---
 
@@ -206,26 +224,26 @@ cmake --build build --config Release
 
 ### Current Bottlenecks
 
-1. **`std::string` topic**: Topic as `std::string` incurs copy and hash overhead
-2. **Single Router thread** (multi-dispatcher mode): Router is a serial bottleneck, may limit throughput under heavy load
-3. **Wildcard matching**: Every message must iterate all wildcard_entries_ for string matching
-4. **3-tier backoff**: Sleep phase during low load increases tail latency
+1. **Single Router thread** (multi-dispatcher mode): Router is a serial bottleneck, may limit throughput under heavy load
+2. **publish path TopicRegistry resolve**: Each publish requires shared_lock + hash table lookup in the registry
 
 ### Completed Optimizations
 
 | Optimization | Benefit | Status |
 |---|---|---|
-| Object pool replacing `shared_ptr` | Min latency 100x, multi-topic +18% | ✅ Done |
+| Object pool replacing `shared_ptr` | Min latency 180x | ✅ Done |
 | Multi-dispatcher (topic sharding) | Horizontal scaling on consumer side | ✅ Done |
+| TopicId integer routing | Multi-topic +86%, p50 latency ~63x | ✅ Done |
+| Wildcard trie index | Matching O(depth), independent of pattern count | ✅ Done |
+| Condition variable replacing sleep backoff | p50 latency ~7x, p99 ~3x | ✅ Done |
+| Trie transparent hash + empty node pruning | Match path zero-allocation, prevents memory leak | ✅ Done |
+| API `string_view` parameters | Callers no longer need `std::string` | ✅ Done |
 
 ### Potential Optimization Directions
 
 | Optimization | Expected Benefit | Complexity |
 |---|---|---|
-| Topic `string_view` + pre-registered ID | QPS +10~20% | Low |
-| Wildcard trie index | Wildcard matching O(1) | Medium |
 | Batch dequeue | QPS +20~30% | Medium |
-| Condition variable replacing sleep backoff | Tail latency ↓90% | Low |
 
 ---
 
@@ -233,7 +251,7 @@ cmake --build build --config Release
 
 | Solution | Typical QPS | Lock-Free | Coroutines | Object Pool | Wildcards |
 |---|---|---|---|---|---|
-| **MsgBus (this project)** | ~6.7M | ✓ | ✓ | ✓ | ✓ |
+| **MsgBus (this project)** | ~9.2M | ✓ | ✓ | ✓ | ✓ |
 | Boost.Signals2 | ~1-2M | ✗ | ✗ | ✗ | ✗ |
 | Qt Signals/Slots | ~0.5-1M | ✗ | ✗ | ✗ | ✗ |
 | moodycamel + manual routing | ~8-15M | ✓ | ✗ | ✗ | ✗ |
