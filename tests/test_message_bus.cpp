@@ -146,24 +146,19 @@ TEST(MessagePtrTest, SelfMoveAssignment) {
 }
 
 TEST(MessagePtrTest, RecyclerCalledOnDestroy) {
-    bool recycled = false;
     auto* raw = new TypedMessage<int>(1, 1);
+    // Use data_ as a flag: recycler sets it to a sentinel instead of deleting
     raw->recycler_ = [](IMessage* msg) {
-        // Just delete — the test verifies the callback is invoked
-        *static_cast<bool*>(
-            reinterpret_cast<void*>(
-                &static_cast<TypedMessage<int>*>(msg)->data_)) = true;
+        static_cast<TypedMessage<int>*>(msg)->data_ = 12345;
     };
-    // Actually, let's use a simpler approach
-    raw->recycler_ = nullptr;
     {
         MessagePtr p = MessagePtr::adopt(raw);
-        // Override recycler to track invocation via a captured flag address
-        // We can't easily capture the flag in a C function pointer,
-        // so test the delete path (no recycler) is the default.
+        raw->ref_count_.store(1, std::memory_order_relaxed);
+        // p goes out of scope → recycler called instead of delete
     }
-    // If we get here, the delete path worked without crash/leak.
-    // For recycler path, test via ObjectPool below.
+    // raw is still alive because the recycler did NOT delete it
+    EXPECT_EQ(raw->data_, 12345);
+    delete raw;
 }
 
 TEST(MessagePtrTest, ResetToNull) {
