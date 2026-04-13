@@ -119,7 +119,7 @@ public:
 
     /// Publish a message to a topic. Returns false if queue is full.
     template <typename T>
-    bool publish(const std::string& topic, T msg) {
+    bool publish(std::string_view topic, T msg) {
         TopicId tid = registry_.resolve(topic);
         auto& pool = TypedMessagePool<T>::instance();
         TypedMessage<T>* raw = pool.acquire();
@@ -138,17 +138,25 @@ public:
     /// Wildcards: '*' matches one level, '#' matches zero or more trailing levels.
     /// Returns a subscription ID.
     template <typename T, typename Handler>
-    SubscriptionId subscribe(const std::string& topic, Handler&& handler) {
+    SubscriptionId subscribe(std::string_view topic, Handler&& handler) {
         auto id = next_id_.fetch_add(1, std::memory_order_relaxed) + 1;
 
         if (isWildcard(topic)) {
+            // Validate: '#' must be the last segment (MQTT rule)
+            auto pos = topic.find('#');
+            if (pos != std::string_view::npos &&
+                pos + 1 != topic.size()) {
+                throw std::runtime_error(
+                    "Invalid wildcard pattern: '#' must be the last segment");
+            }
+
             // Wildcard subscription: insert into trie index
             auto slot = std::make_shared<TopicSlot<T>>();
             slot->addSubscriber(
                 std::function<void(const T&)>(std::forward<Handler>(handler)), id);
 
             std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
-            wildcard_trie_.insert({topic, &typeid(T), slot, id});
+            wildcard_trie_.insert(topic, {&typeid(T), slot, id});
 
             std::lock_guard<std::mutex> lk(sub_map_mutex_);
             sub_to_topic_[id] = {kInvalidTopicId, true};
@@ -238,8 +246,8 @@ public:
     };
 
     template <typename T>
-    AsyncWaitAwaitable<T> async_wait(const std::string& topic) {
-        return AsyncWaitAwaitable<T>(*this, topic);
+    AsyncWaitAwaitable<T> async_wait(std::string_view topic) {
+        return AsyncWaitAwaitable<T>(*this, std::string(topic));
     }
 
     /// Returns the number of dispatcher threads.

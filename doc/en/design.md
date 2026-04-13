@@ -51,7 +51,7 @@ Implement a **single-process, high-performance, lock-free (or minimal-lock), cor
                 │                  ▼  Route by topic                       │
                 │  ┌────────────────────────────────────────┐              │
                 │  │  ① Exact match: TopicSlot<T> (COW list) │              │
-                │  │  ② Wildcard match: WildcardEntry list   │              │
+                │  │  ② Wildcard match: WildcardTrie index   │              │
                 │  │     '*' one level / '#' multi-level     │              │
                 │  │  ┌────────┐ ┌────────┐ ┌───────┐      │              │
                 │  │  │ Sub 1  │ │ Sub 2  │ │Sub N  │      │              │
@@ -105,8 +105,8 @@ MsgBus/
 │   └── wildcard_example.cpp           # Wildcard subscription example
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # Unit tests (59 GTest cases)
-│   └── bench_message_bus.cpp           # Benchmarks (6 scenarios)
+│   ├── test_message_bus.cpp            # Unit tests (73 GTest cases)
+│   └── bench_message_bus.cpp           # Benchmarks (8 scenarios)
 └── .github/
     └── workflows/
         ├── ci.yml                      # CI: UT on push/PR (Windows/Linux/macOS)
@@ -228,7 +228,6 @@ inline constexpr size_t kDefaultQueueCapacity  = 65536;
 inline constexpr size_t kDefaultPoolCapacity    = 8192;
 inline constexpr unsigned kSpinThreshold        = 64;
 inline constexpr unsigned kYieldThreshold       = 256;
-inline constexpr unsigned kSleepMicroseconds    = 50;
 
 template <typename T>
 struct TypedMessagePool {
@@ -324,12 +323,13 @@ Builds a trie from wildcard subscription patterns indexed by topic levels. On di
 ```cpp
 class WildcardTrie {
 public:
-    void insert(const Entry& entry);       // Insert wildcard pattern
-    bool remove(SubscriptionId id);        // Remove by subscription ID
+    void insert(std::string_view pattern,  // Insert wildcard pattern
+               const Entry& entry);
+    bool remove(SubscriptionId id);        // Remove by ID (auto-prunes empty nodes)
     void match(std::string_view topic,     // Find matching slots
                const std::type_info& type,
                std::vector<ITopicSlot*>& out) const;
-    bool empty() const;
+    bool empty() const;                    // O(1) entry counter
 };
 ```
 
@@ -350,7 +350,9 @@ matchNode(node, levels, depth):
 | Complexity | O(topic depth), independent of pattern count |
 | Scalability | 100 patterns vs 1000 patterns: same QPS (~1.6M) |
 | Thread safety | External shared_mutex protection (read-write separation) |
-| Memory | `unordered_map<string, unique_ptr<Node>>` tree structure |
+| Memory | `unordered_map<string, unique_ptr<Node>>` tree structure, auto-prunes empty nodes on remove |
+| Zero-alloc lookup | Transparent hash (`SVHash`/`SVEqual`), `find(string_view)` avoids temporary `std::string` |
+| `empty()` | O(1) `entry_count_` counter, not recursive traversal |
 
 ---
 
@@ -404,15 +406,15 @@ public:
     void stop();    // Stop and drain queue
 
     template <typename T>
-    bool publish(const std::string& topic, T msg);          // Publish (pool + lock-free enqueue)
+    bool publish(std::string_view topic, T msg);          // Publish (pool + lock-free enqueue)
 
     template <typename T, typename Handler>
-    SubscriptionId subscribe(const std::string& topic, Handler&& handler); // Supports wildcards
+    SubscriptionId subscribe(std::string_view topic, Handler&& handler); // Supports wildcards
 
     void unsubscribe(SubscriptionId id);
 
     template <typename T>
-    AsyncWaitAwaitable<T> async_wait(const std::string& topic); // Coroutine await
+    AsyncWaitAwaitable<T> async_wait(std::string_view topic); // Coroutine await
 
     unsigned dispatcher_count() const;  // Returns dispatcher thread count
 };
@@ -531,6 +533,7 @@ co_await bus.async_wait<T>(topic)
 * `IMessage` + `typeid` runtime verification
 * One type per topic prevents `static_cast` errors
 * Wildcard subscriptions also perform type checks, skipping type-mismatched messages
+* Wildcard format validation: `#` must be the last segment, otherwise throws `std::runtime_error`
 
 ---
 
@@ -607,7 +610,11 @@ co_await bus.async_wait<T>(topic)
 - [x] WildcardTrie (trie built from topic levels)
 - [x] Matching complexity O(depth), independent of pattern count
 - [x] Replaces wildcard_entries_ linear scan
-- [x] WildcardTrie unit tests (7 cases)
+- [x] WildcardTrie unit tests (10 cases)
+- [x] Transparent hash (`SVHash`/`SVEqual`) for zero-allocation `find(string_view)`
+- [x] O(1) `entry_count_` replaces recursive `isEmpty()` traversal
+- [x] `remove()` auto-prunes empty trie nodes (prevents memory leak)
+- [x] `insert()` accepts `string_view pattern` parameter, Entry no longer stores redundant pattern string
 
 ### Condition Variable Backoff
 - [x] dispatch/router/worker threads use condition_variable instead of sleep
@@ -627,6 +634,10 @@ co_await bus.async_wait<T>(topic)
 - [x] subscribe auto-detects wildcard vs. exact
 - [x] dispatchMessage: exact first, then wildcard
 - [x] unsubscribe wildcard cleanup
+- [x] Wildcard format validation (`#` must be last segment, throws on violation)
+
+### API Optimization
+- [x] `publish()`/`subscribe()`/`async_wait()` topic parameter changed from `const std::string&` to `std::string_view`
 
 ### Dispatch Logic
 - [x] Dispatcher thread (3-tier backoff)
@@ -648,7 +659,7 @@ co_await bus.async_wait<T>(topic)
 - [ ] Metrics (queue depth, latency)
 
 ### Engineering
-- [x] Unit tests (66 GTest cases)
+- [x] Unit tests (73 GTest cases)
 - [x] Code coverage (OpenCppCoverage / lcov, 96.1%)
 - [x] Benchmarks (8 scenarios)
 - [x] GitHub Actions CI (Windows/Linux/macOS, UT gate)

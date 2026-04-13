@@ -51,7 +51,7 @@
                 │                  ▼  按topic路由                          │
                 │  ┌────────────────────────────────────────┐              │
                 │  │  ① 精确匹配: TopicSlot<T> (COW 列表)   │              │
-                │  │  ② 通配符匹配: WildcardEntry 列表      │              │
+                │  │  ② 通配符匹配: WildcardTrie 索引        │              │
                 │  │     '*' 匹配单层 / '#' 匹配多层        │              │
                 │  │  ┌────────┐ ┌────────┐ ┌───────┐      │              │
                 │  │  │ Sub 1  │ │ Sub 2  │ │Sub N  │      │              │
@@ -105,8 +105,8 @@ MsgBus/
 │   └── wildcard_example.cpp           # 通配符订阅示例
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # 单元测试（59 个 GTest 用例）
-│   └── bench_message_bus.cpp           # 性能压测（6 个基准场景）
+│   ├── test_message_bus.cpp            # 单元测试（73 个 GTest 用例）
+│   └── bench_message_bus.cpp           # 性能压测（8 个基准场景）
 └── .github/
     └── workflows/
         ├── ci.yml                      # CI: UT on push/PR (Windows/Linux/macOS)
@@ -228,7 +228,6 @@ inline constexpr size_t kDefaultQueueCapacity  = 65536;
 inline constexpr size_t kDefaultPoolCapacity    = 8192;
 inline constexpr unsigned kSpinThreshold        = 64;
 inline constexpr unsigned kYieldThreshold       = 256;
-inline constexpr unsigned kSleepMicroseconds    = 50;
 
 template <typename T>
 struct TypedMessagePool {
@@ -324,12 +323,13 @@ bool isWildcard(std::string_view pattern);
 ```cpp
 class WildcardTrie {
 public:
-    void insert(const Entry& entry);       // 插入通配符 pattern
-    bool remove(SubscriptionId id);        // 按 ID 移除
+    void insert(std::string_view pattern,  // 插入通配符 pattern
+               const Entry& entry);
+    bool remove(SubscriptionId id);        // 按 ID 移除（自动修剪空节点）
     void match(std::string_view topic,     // 查找匹配的 slot
                const std::type_info& type,
                std::vector<ITopicSlot*>& out) const;
-    bool empty() const;
+    bool empty() const;                    // O(1) entry 计数器
 };
 ```
 
@@ -350,7 +350,9 @@ matchNode(node, levels, depth):
 | 复杂度 | O(topic depth)，与 pattern 数量无关 |
 | 扩展性 | 100 个 pattern vs 1000 个 pattern QPS 相同（~1.6M） |
 | 线程安全 | 外部 shared_mutex 保护（读写分离） |
-| 内存 | `unordered_map<string, unique_ptr<Node>>` 树结构 |
+| 内存 | `unordered_map<string, unique_ptr<Node>>` 树结构，移除后自动修剪空节点 |
+| 查找零分配 | 透明哈希（`SVHash`/`SVEqual`），`find(string_view)` 不构造临时 `std::string` |
+| `empty()` | O(1) `entry_count_` 计数器，非递归遍历 |
 
 ---
 
@@ -404,15 +406,15 @@ public:
     void stop();    // 停止并排空队列
 
     template <typename T>
-    bool publish(const std::string& topic, T msg);          // 发布（对象池 + 无锁入队）
+    bool publish(std::string_view topic, T msg);          // 发布（对象池 + 无锁入队）
 
     template <typename T, typename Handler>
-    SubscriptionId subscribe(const std::string& topic, Handler&& handler); // 支持通配符
+    SubscriptionId subscribe(std::string_view topic, Handler&& handler); // 支持通配符
 
     void unsubscribe(SubscriptionId id);
 
     template <typename T>
-    AsyncWaitAwaitable<T> async_wait(const std::string& topic); // 协程等待
+    AsyncWaitAwaitable<T> async_wait(std::string_view topic); // 协程等待
 
     unsigned dispatcher_count() const;  // 返回 dispatcher 线程数
 };
@@ -531,6 +533,7 @@ co_await bus.async_wait<T>(topic)
 * `IMessage` + `typeid` 运行时校验
 * 同一 topic 只允许一种类型，防止 `static_cast` 错误
 * 通配符订阅同样做类型校验，跳过类型不匹配的消息
+* 通配符格式校验：`#` 必须为最后一段，否则抛出 `std::runtime_error`
 
 ---
 
@@ -607,7 +610,11 @@ co_await bus.async_wait<T>(topic)
 - [x] 实现 WildcardTrie（按 topic 层级建立 Trie 树）
 - [x] 匹配复杂度 O(depth)，与模式数量无关
 - [x] 替代 wildcard_entries_ 线性扫描
-- [x] WildcardTrie 单元测试（7 个用例）
+- [x] WildcardTrie 单元测试（10 个用例）
+- [x] 透明哈希（`SVHash`/`SVEqual`）实现 `find(string_view)` 零分配
+- [x] O(1) `entry_count_` 替代递归 `isEmpty()` 遍历
+- [x] `remove()` 后自动修剪空 Trie 节点（防内存泄漏）
+- [x] `insert()` 接受 `string_view pattern` 参数，Entry 不存储冗余 pattern 字符串
 
 ### 条件变量退避
 - [x] dispatch/router/worker 线程用 condition_variable 替代 sleep
@@ -627,6 +634,10 @@ co_await bus.async_wait<T>(topic)
 - [x] subscribe 自动识别通配符 vs 精确匹配
 - [x] dispatchMessage 先精确后通配符
 - [x] unsubscribe 通配符清理
+- [x] 通配符格式校验（`#` 必须为最后一段，否则抛异常）
+
+### API 优化
+- [x] `publish()`/`subscribe()`/`async_wait()` topic 参数从 `const std::string&` 改为 `std::string_view`
 
 ### 分发逻辑
 - [x] 实现 dispatcher 线程（三级退避）
@@ -648,7 +659,7 @@ co_await bus.async_wait<T>(topic)
 - [ ] metrics（队列长度、延迟）
 
 ### 工程化
-- [x] 单元测试（66 个 GTest 用例）
+- [x] 单元测试（73 个 GTest 用例）
 - [x] 代码覆盖率统计（OpenCppCoverage / lcov，96.1%）
 - [x] 性能压测（8 个基准场景）
 - [x] GitHub Actions CI（Windows/Linux/macOS，UT 门禁）

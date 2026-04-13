@@ -28,18 +28,18 @@ namespace msgbus {
 class WildcardTrie {
 public:
     struct Entry {
-        std::string pattern;
         const std::type_info* type;
         std::shared_ptr<ITopicSlot> slot;
         SubscriptionId sub_id;
     };
 
     /// Insert a wildcard pattern. Caller must hold external write lock.
-    void insert(const Entry& entry) {
-        auto levels = splitLevels(entry.pattern);
+    void insert(std::string_view pattern, const Entry& entry) {
+        auto levels = splitLevels(pattern);
         Node* cur = &root_;
+        ++entry_count_;
         for (auto& level : levels) {
-            auto it = cur->children.find(std::string(level));
+            auto it = cur->children.find(level);
             if (it == cur->children.end()) {
                 auto child = std::make_unique<Node>();
                 auto* ptr = child.get();
@@ -55,7 +55,9 @@ public:
     /// Remove a subscription by ID. Returns true if found.
     /// Caller must hold external write lock.
     bool remove(SubscriptionId id) {
-        return removeFrom(&root_, id);
+        bool found = removeFrom(&root_, id);
+        if (found) --entry_count_;
+        return found;
     }
 
     /// Find all matching entries for a concrete topic.
@@ -66,18 +68,33 @@ public:
         matchNode(&root_, levels, 0, msg_type, out);
     }
 
-    /// Returns true if trie has no entries at all.
+    /// Returns true if trie has no entries at all. O(1).
     bool empty() const {
-        return isEmpty(&root_);
+        return entry_count_ == 0;
     }
 
 private:
+    // Transparent hash/equal so find(string_view) avoids allocating a temp std::string.
+    struct SVHash {
+        using is_transparent = void;
+        size_t operator()(std::string_view sv) const noexcept {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+    struct SVEqual {
+        using is_transparent = void;
+        bool operator()(std::string_view a, std::string_view b) const noexcept {
+            return a == b;
+        }
+    };
+
     struct Node {
-        std::unordered_map<std::string, std::unique_ptr<Node>> children;
+        std::unordered_map<std::string, std::unique_ptr<Node>, SVHash, SVEqual> children;
         std::vector<Entry> entries; // non-empty only at terminal nodes
     };
 
     Node root_;
+    size_t entry_count_ = 0;
 
     static std::vector<std::string_view> splitLevels(std::string_view s) {
         std::vector<std::string_view> levels;
@@ -100,7 +117,7 @@ private:
         if (!node) return;
 
         // '#' child matches all remaining levels (including zero)
-        auto hash_it = node->children.find("#");
+        auto hash_it = node->children.find(std::string_view("#"));
         if (hash_it != node->children.end()) {
             for (auto& entry : hash_it->second->entries) {
                 if (*entry.type == msg_type) {
@@ -121,13 +138,13 @@ private:
         }
 
         // Exact level match
-        auto exact_it = node->children.find(std::string(levels[depth]));
+        auto exact_it = node->children.find(levels[depth]);
         if (exact_it != node->children.end()) {
             matchNode(exact_it->second.get(), levels, depth + 1, msg_type, out);
         }
 
         // '*' matches exactly one level
-        auto star_it = node->children.find("*");
+        auto star_it = node->children.find(std::string_view("*"));
         if (star_it != node->children.end()) {
             matchNode(star_it->second.get(), levels, depth + 1, msg_type, out);
         }
@@ -142,20 +159,19 @@ private:
                 return true;
             }
         }
-        // Recurse into children
-        for (auto& [key, child] : node->children) {
-            if (removeFrom(child.get(), id)) return true;
+        // Recurse into children; prune empty nodes on the way back
+        for (auto it = node->children.begin(); it != node->children.end(); ++it) {
+            if (removeFrom(it->second.get(), id)) {
+                if (it->second->entries.empty() && it->second->children.empty()) {
+                    node->children.erase(it);
+                }
+                return true;
+            }
         }
         return false;
     }
 
-    bool isEmpty(const Node* node) const {
-        if (!node->entries.empty()) return false;
-        for (auto& [key, child] : node->children) {
-            if (!isEmpty(child.get())) return false;
-        }
-        return true;
-    }
+
 };
 
 } // namespace msgbus

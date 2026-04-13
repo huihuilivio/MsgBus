@@ -868,7 +868,7 @@ TEST(WildcardTrieTest, SingleLevelMatch) {
     WildcardTrie trie;
     auto slot = std::make_shared<TopicSlot<int>>();
     slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
-    trie.insert({"sensor/*/temp", &typeid(int), slot, 1});
+    trie.insert("sensor/*/temp", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
     trie.match("sensor/1/temp", typeid(int), matched);
@@ -887,7 +887,7 @@ TEST(WildcardTrieTest, MultiLevelMatch) {
     WildcardTrie trie;
     auto slot = std::make_shared<TopicSlot<int>>();
     slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
-    trie.insert({"sensor/#", &typeid(int), slot, 1});
+    trie.insert("sensor/#", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
     trie.match("sensor/temp", typeid(int), matched);
@@ -910,7 +910,7 @@ TEST(WildcardTrieTest, MixedWildcards) {
     WildcardTrie trie;
     auto slot = std::make_shared<TopicSlot<int>>();
     slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
-    trie.insert({"a/*/c/#", &typeid(int), slot, 1});
+    trie.insert("a/*/c/#", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
     trie.match("a/b/c/d/e", typeid(int), matched);
@@ -929,11 +929,11 @@ TEST(WildcardTrieTest, MultiplePatterns) {
     WildcardTrie trie;
     auto slot1 = std::make_shared<TopicSlot<int>>();
     slot1->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
-    trie.insert({"sensor/#", &typeid(int), slot1, 1});
+    trie.insert("sensor/#", {&typeid(int), slot1, 1});
 
     auto slot2 = std::make_shared<TopicSlot<int>>();
     slot2->addSubscriber(std::function<void(const int&)>([](const int&) {}), 2);
-    trie.insert({"sensor/*/temp", &typeid(int), slot2, 2});
+    trie.insert("sensor/*/temp", {&typeid(int), slot2, 2});
 
     std::vector<ITopicSlot*> matched;
     trie.match("sensor/1/temp", typeid(int), matched);
@@ -944,7 +944,7 @@ TEST(WildcardTrieTest, RemoveEntry) {
     WildcardTrie trie;
     auto slot = std::make_shared<TopicSlot<int>>();
     slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
-    trie.insert({"sensor/#", &typeid(int), slot, 1});
+    trie.insert("sensor/#", {&typeid(int), slot, 1});
 
     EXPECT_FALSE(trie.empty());
     EXPECT_TRUE(trie.remove(1));
@@ -959,7 +959,7 @@ TEST(WildcardTrieTest, TypeFiltering) {
     WildcardTrie trie;
     auto slot = std::make_shared<TopicSlot<int>>();
     slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
-    trie.insert({"data/#", &typeid(int), slot, 1});
+    trie.insert("data/#", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
     trie.match("data/x", typeid(int), matched);
@@ -974,7 +974,7 @@ TEST(WildcardTrieTest, HashMatchesRoot) {
     WildcardTrie trie;
     auto slot = std::make_shared<TopicSlot<int>>();
     slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
-    trie.insert({"#", &typeid(int), slot, 1});
+    trie.insert("#", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
     trie.match("anything/at/all", typeid(int), matched);
@@ -983,4 +983,116 @@ TEST(WildcardTrieTest, HashMatchesRoot) {
     matched.clear();
     trie.match("x", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
+}
+
+TEST(WildcardTrieTest, EmptyNodePruning) {
+    // After removal, empty trie nodes should be pruned
+    WildcardTrie trie;
+    auto slot = std::make_shared<TopicSlot<int>>();
+    slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert("a/b/c/d", {&typeid(int), slot, 1});
+
+    EXPECT_FALSE(trie.empty());
+    EXPECT_TRUE(trie.remove(1));
+    EXPECT_TRUE(trie.empty());
+
+    // Insert again on the same path — should work (nodes were pruned, rebuilt)
+    auto slot2 = std::make_shared<TopicSlot<int>>();
+    slot2->addSubscriber(std::function<void(const int&)>([](const int&) {}), 2);
+    trie.insert("a/b/c/d", {&typeid(int), slot2, 2});
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("a/b/c/d", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+}
+
+TEST(WildcardTrieTest, PartialPruning) {
+    // When two patterns share a prefix, removing one should not break the other
+    WildcardTrie trie;
+    auto slot1 = std::make_shared<TopicSlot<int>>();
+    slot1->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert("a/b/c", {&typeid(int), slot1, 1});
+
+    auto slot2 = std::make_shared<TopicSlot<int>>();
+    slot2->addSubscriber(std::function<void(const int&)>([](const int&) {}), 2);
+    trie.insert("a/b/d", {&typeid(int), slot2, 2});
+
+    EXPECT_TRUE(trie.remove(1)); // remove a/b/c, prune 'c' node but keep 'a/b'
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("a/b/c", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 0u); // removed
+
+    matched.clear();
+    trie.match("a/b/d", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u); // still alive
+}
+
+TEST(WildcardTrieTest, EntryCountAccuracy) {
+    WildcardTrie trie;
+    EXPECT_TRUE(trie.empty());
+
+    auto make_slot = [](SubscriptionId id) {
+        auto slot = std::make_shared<TopicSlot<int>>();
+        slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), id);
+        return slot;
+    };
+
+    trie.insert("a/#", {&typeid(int), make_slot(1), 1});
+    trie.insert("b/#", {&typeid(int), make_slot(2), 2});
+    trie.insert("c/#", {&typeid(int), make_slot(3), 3});
+    EXPECT_FALSE(trie.empty());
+
+    EXPECT_TRUE(trie.remove(1));
+    EXPECT_FALSE(trie.empty());
+    EXPECT_TRUE(trie.remove(2));
+    EXPECT_FALSE(trie.empty());
+    EXPECT_TRUE(trie.remove(3));
+    EXPECT_TRUE(trie.empty());
+
+    // Remove non-existent ID
+    EXPECT_FALSE(trie.remove(999));
+    EXPECT_TRUE(trie.empty()); // count should not go negative / underflow
+}
+
+// ---------- Wildcard Validation Tests ----------
+
+TEST_F(MessageBusTest, InvalidWildcardHashNotLast) {
+    // '#' must be the last segment
+    EXPECT_THROW(
+        bus.subscribe<int>("a/#/b", [](const int&) {}),
+        std::runtime_error);
+}
+
+TEST_F(MessageBusTest, ValidWildcardPatterns) {
+    // These should all succeed without throwing
+    EXPECT_NO_THROW(bus.subscribe<int>("#", [](const int&) {}));
+    EXPECT_NO_THROW(bus.subscribe<int>("sensor/#", [](const int&) {}));
+    EXPECT_NO_THROW(bus.subscribe<int>("sensor/*/temp", [](const int&) {}));
+    EXPECT_NO_THROW(bus.subscribe<int>("a/*/c/#", [](const int&) {}));
+}
+
+// ---------- string_view API Tests ----------
+
+TEST_F(MessageBusTest, PublishWithStringView) {
+    std::promise<int> promise;
+    auto future = promise.get_future();
+
+    std::string_view topic_sv = "sv/test";
+    bus.subscribe<int>(topic_sv, [&](const int& v) { promise.set_value(v); });
+    bus.publish<int>(topic_sv, 77);
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(future.get(), 77);
+}
+
+TEST_F(MessageBusTest, PublishWithCharLiteral) {
+    std::promise<int> promise;
+    auto future = promise.get_future();
+
+    bus.subscribe<int>("lit/test", [&](const int& v) { promise.set_value(v); });
+    bus.publish<int>("lit/test", 88);
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(future.get(), 88);
 }

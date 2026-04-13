@@ -236,6 +236,8 @@ cmake --build build --config Release
 | TopicId 整数路由 | 多 Topic +86%，p50 63x | ✅ 已实现 |
 | 通配符 Trie 索引 | 匹配 O(depth)，不随模式数增长 | ✅ 已实现 |
 | 条件变量替代 sleep 退避 | p50 延迟 ~7x，p99 ~3x | ✅ 已实现 |
+| Trie 透明哈希 + 空节点修剪 | 匹配路径零分配，防内存泄漏 | ✅ 已实现 |
+| API `string_view` 参数 | 调用方无需持有 `std::string` | ✅ 已实现 |
 
 ### 潜在优化方向
 

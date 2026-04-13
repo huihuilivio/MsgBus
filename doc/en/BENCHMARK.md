@@ -236,6 +236,8 @@ cmake --build build --config Release
 | TopicId integer routing | Multi-topic +86%, p50 latency ~63x | ✅ Done |
 | Wildcard trie index | Matching O(depth), independent of pattern count | ✅ Done |
 | Condition variable replacing sleep backoff | p50 latency ~7x, p99 ~3x | ✅ Done |
+| Trie transparent hash + empty node pruning | Match path zero-allocation, prevents memory leak | ✅ Done |
+| API `string_view` parameters | Callers no longer need `std::string` | ✅ Done |
 
 ### Potential Optimization Directions
 
