@@ -199,3 +199,44 @@ cmake --build build --config Release
 | Min latency | 36μs → 0.3μs (**~100x**) |
 | p50 latency | 3.6ms → 2.2ms (**~40%**) |
 | Multi-topic QPS | 4.95M → 5.8M (**+18%**) |
+
+---
+
+## Performance Bottleneck Analysis
+
+### Current Bottlenecks
+
+1. **`std::string` topic**: Topic as `std::string` incurs copy and hash overhead
+2. **Single Router thread** (multi-dispatcher mode): Router is a serial bottleneck, may limit throughput under heavy load
+3. **Wildcard matching**: Every message must iterate all wildcard_entries_ for string matching
+4. **3-tier backoff**: Sleep phase during low load increases tail latency
+
+### Completed Optimizations
+
+| Optimization | Benefit | Status |
+|---|---|---|
+| Object pool replacing `shared_ptr` | Min latency 100x, multi-topic +18% | ✅ Done |
+| Multi-dispatcher (topic sharding) | Horizontal scaling on consumer side | ✅ Done |
+
+### Potential Optimization Directions
+
+| Optimization | Expected Benefit | Complexity |
+|---|---|---|
+| Topic `string_view` + pre-registered ID | QPS +10~20% | Low |
+| Wildcard trie index | Wildcard matching O(1) | Medium |
+| Batch dequeue | QPS +20~30% | Medium |
+| Condition variable replacing sleep backoff | Tail latency ↓90% | Low |
+
+---
+
+## Comparison with Alternatives (Order of Magnitude)
+
+| Solution | Typical QPS | Lock-Free | Coroutines | Object Pool | Wildcards |
+|---|---|---|---|---|---|
+| **MsgBus (this project)** | ~6.7M | ✓ | ✓ | ✓ | ✓ |
+| Boost.Signals2 | ~1-2M | ✗ | ✗ | ✗ | ✗ |
+| Qt Signals/Slots | ~0.5-1M | ✗ | ✗ | ✗ | ✗ |
+| moodycamel + manual routing | ~8-15M | ✓ | ✗ | ✗ | ✗ |
+| Redis Pub/Sub (local) | ~0.1-0.5M | ✗ | ✗ | ✗ | ✓ |
+
+> Note: Comparison data are order-of-magnitude estimates. Actual results depend on hardware and workload.
