@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "msgbus/topic_matcher.h"
+
 using namespace msgbus;
 
 // ---------- LockFreeQueue Tests ----------
@@ -298,4 +300,180 @@ TEST_F(MessageBusTest, CoroutineAsyncWaitString) {
     ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
               std::future_status::ready);
     EXPECT_EQ(future.get(), "coroutine!");
+}
+
+// ---------- Topic Matcher Tests ----------
+
+TEST(TopicMatcherTest, ExactMatch) {
+    EXPECT_TRUE(topicMatches("a/b/c", "a/b/c"));
+    EXPECT_FALSE(topicMatches("a/b/c", "a/b/d"));
+    EXPECT_FALSE(topicMatches("a/b", "a/b/c"));
+}
+
+TEST(TopicMatcherTest, SingleLevelWildcard) {
+    EXPECT_TRUE(topicMatches("sensor/*/temp", "sensor/1/temp"));
+    EXPECT_TRUE(topicMatches("sensor/*/temp", "sensor/abc/temp"));
+    EXPECT_FALSE(topicMatches("sensor/*/temp", "sensor/1/2/temp"));
+    EXPECT_FALSE(topicMatches("sensor/*/temp", "sensor/1/humidity"));
+}
+
+TEST(TopicMatcherTest, MultiLevelWildcard) {
+    EXPECT_TRUE(topicMatches("sensor/#", "sensor/1/temp"));
+    EXPECT_TRUE(topicMatches("sensor/#", "sensor"));
+    EXPECT_TRUE(topicMatches("sensor/#", "sensor/a/b/c/d"));
+    EXPECT_TRUE(topicMatches("#", "anything/at/all"));
+    EXPECT_FALSE(topicMatches("sensor/#", "other/1"));
+}
+
+TEST(TopicMatcherTest, MixedWildcards) {
+    EXPECT_TRUE(topicMatches("a/*/c/#", "a/b/c/d/e"));
+    EXPECT_TRUE(topicMatches("a/*/c/#", "a/x/c"));
+    EXPECT_FALSE(topicMatches("a/*/c/#", "a/b/d"));
+}
+
+TEST(TopicMatcherTest, IsWildcard) {
+    EXPECT_TRUE(isWildcard("sensor/*"));
+    EXPECT_TRUE(isWildcard("sensor/#"));
+    EXPECT_TRUE(isWildcard("*/temp"));
+    EXPECT_FALSE(isWildcard("sensor/temp"));
+    EXPECT_FALSE(isWildcard("plain"));
+}
+
+// ---------- Wildcard Subscription Tests ----------
+
+TEST_F(MessageBusTest, WildcardSingleLevel) {
+    std::atomic<int> count{0};
+    bus.subscribe<int>("sensor/*/temp", [&](const int&) {
+        count.fetch_add(1);
+    });
+
+    bus.publish<int>("sensor/1/temp", 10);
+    bus.publish<int>("sensor/2/temp", 20);
+    bus.publish<int>("sensor/1/humidity", 30); // should NOT match
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(count.load(), 2);
+}
+
+TEST_F(MessageBusTest, WildcardMultiLevel) {
+    std::atomic<int> count{0};
+    bus.subscribe<int>("system/#", [&](const int&) {
+        count.fetch_add(1);
+    });
+
+    bus.publish<int>("system/cpu", 1);
+    bus.publish<int>("system/mem/used", 2);
+    bus.publish<int>("system/disk/sda/read", 3);
+    bus.publish<int>("other/thing", 4); // should NOT match
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(count.load(), 3);
+}
+
+TEST_F(MessageBusTest, WildcardUnsubscribe) {
+    std::atomic<int> count{0};
+    auto id = bus.subscribe<int>("event/#", [&](const int&) {
+        count.fetch_add(1);
+    });
+
+    bus.publish<int>("event/click", 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(count.load(), 1);
+
+    bus.unsubscribe(id);
+
+    bus.publish<int>("event/click", 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(count.load(), 1);
+}
+
+TEST_F(MessageBusTest, WildcardAndExactCoexist) {
+    std::atomic<int> exact_count{0};
+    std::atomic<int> wild_count{0};
+
+    bus.subscribe<int>("data/temp", [&](const int&) {
+        exact_count.fetch_add(1);
+    });
+    bus.subscribe<int>("data/*", [&](const int&) {
+        wild_count.fetch_add(1);
+    });
+
+    bus.publish<int>("data/temp", 42);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(exact_count.load(), 1);
+    EXPECT_EQ(wild_count.load(), 1);
+}
+
+// ---------- Multi-Dispatcher Tests ----------
+
+class MultiDispatcherTest : public ::testing::Test {
+protected:
+    MessageBus bus{65536, 4}; // 4 worker threads
+
+    void SetUp() override { bus.start(); }
+    void TearDown() override { bus.stop(); }
+};
+
+TEST_F(MultiDispatcherTest, BasicPubSub) {
+    std::promise<int> promise;
+    auto future = promise.get_future();
+
+    bus.subscribe<int>("multi/test", [&](const int& v) {
+        promise.set_value(v);
+    });
+    bus.publish<int>("multi/test", 99);
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_EQ(future.get(), 99);
+}
+
+TEST_F(MultiDispatcherTest, ConcurrentMultiTopic) {
+    constexpr int TOPICS = 8;
+    constexpr int MSGS = 100;
+
+    std::atomic<int> received{0};
+    for (int t = 0; t < TOPICS; ++t) {
+        bus.subscribe<int>("mt/" + std::to_string(t), [&](const int&) {
+            received.fetch_add(1);
+        });
+    }
+
+    std::vector<std::thread> producers;
+    for (int t = 0; t < TOPICS; ++t) {
+        producers.emplace_back([&, t] {
+            std::string topic = "mt/" + std::to_string(t);
+            for (int i = 0; i < MSGS; ++i) {
+                while (!bus.publish<int>(topic, i)) {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+    for (auto& th : producers) th.join();
+
+    for (int i = 0; i < 200 && received.load() < TOPICS * MSGS; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(received.load(), TOPICS * MSGS);
+}
+
+TEST_F(MultiDispatcherTest, WildcardWithMultiDispatcher) {
+    std::atomic<int> count{0};
+    bus.subscribe<int>("sensor/#", [&](const int&) {
+        count.fetch_add(1);
+    });
+
+    bus.publish<int>("sensor/a", 1);
+    bus.publish<int>("sensor/b/c", 2);
+
+    for (int i = 0; i < 100 && count.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(count.load(), 2);
+}
+
+TEST_F(MultiDispatcherTest, DispatcherCount) {
+    EXPECT_EQ(bus.dispatcher_count(), 4u);
 }
