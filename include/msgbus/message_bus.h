@@ -97,7 +97,7 @@ public:
 
         void await_suspend(std::coroutine_handle<> handle) {
             auto s = state_;
-            s->sub_id = s->bus.subscribe<T>(s->topic,
+            s->sub_id = s->bus.template subscribe<T>(s->topic,
                 [s, handle](const T& msg) {
                     s->result = msg;
                     handle.resume();
