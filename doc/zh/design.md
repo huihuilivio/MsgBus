@@ -94,8 +94,9 @@ MsgBus/
 │       ├── object_pool.h              # 无锁对象池（freelist 回收）
 │       ├── subscriber.h               # Subscriber<T> 订阅者定义
 │       ├── topic_matcher.h            # MQTT 风格 topic 通配符匹配
+│       ├── topic_registry.h           # TopicId ↔ 字符串 线程安全注册表
 │       ├── topic_slot.h               # TopicSlot<T> COW 订阅管理
-│       └── message_bus.h              # MessageBus 核心 + 对象池 + 多dispatcher + 通配符 + 协程
+│       └── message_bus.h              # MessageBus 核心 + 对象池 + 多dispatcher + 通配符 + 协程 + TopicRegistry
 ├── examples/
 │   ├── CMakeLists.txt
 │   ├── basic_example.cpp              # 基础 pub/sub 示例
@@ -103,7 +104,7 @@ MsgBus/
 │   └── wildcard_example.cpp           # 通配符订阅示例
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # 单元测试（55 个 GTest 用例）
+│   ├── test_message_bus.cpp            # 单元测试（59 个 GTest 用例）
 │   └── bench_message_bus.cpp           # 性能压测（6 个基准场景）
 └── .github/
     └── workflows/
@@ -174,11 +175,15 @@ public:
 **文件**: `include/msgbus/message.h`
 
 ```cpp
+/// 紧凑的 topic 标识符 — 替代热路径上的 std::string
+using TopicId = uint32_t;
+inline constexpr TopicId kInvalidTopicId = 0;
+
 struct IMessage {
     std::atomic<int> ref_count_{0};         // 侵入式引用计数
     void (*recycler_)(IMessage*) = nullptr; // 回收函数指针
 
-    virtual const std::string& topic();
+    virtual TopicId topic_id();
     virtual const std::type_info& type();
     void add_ref() noexcept;
     bool release_ref() noexcept;            // 归零返回 true
@@ -186,9 +191,9 @@ struct IMessage {
 
 template <typename T>
 struct TypedMessage : IMessage {
-    std::string topic_;
+    TopicId topic_id_;
     T data_;
-    void reset(const std::string& topic, T data); // 池复用时重置
+    void reset(TopicId topic_id, T data); // 池复用时重置（整数赋值替代字符串拷贝）
 };
 ```
 
@@ -207,8 +212,8 @@ public:
 
 * **替代 `shared_ptr`**：消除独立 control block 的堆分配，引用计数直接嵌入 IMessage
 * **recycler 函数指针**：publish 时设置，引用计数归零时调用，将对象归还对象池而非 delete
-* **`reset()` 方法**：池复用时重置 topic/data/ref_count/recycler，避免析构+构造开销
-* 性能提升：最小延迟从 ~36μs 降至 ~0.3μs
+* **`reset()` 方法**：池复用时重置 topic_id/data/ref_count/recycler，整数赋值替代字符串拷贝
+* 性能提升：最小延迟从 ~36μs 降至 ~0.6μs
 
 ---
 
@@ -235,10 +240,11 @@ struct TypedMessagePool {
 
 ```
 publish<T>(topic, msg)
+  → registry_.resolve(topic) → TopicId  // 字符串→整数（shared_lock 快速路径）
   → pool.acquire()
-  → 命中: reset(topic, msg)    // 复用，无堆分配
-  → 未命中: new TypedMessage<T> // 首次创建
-  → raw->recycler_ = &recycle  // 设置回收回调
+  → 命中: reset(topic_id, msg)    // 复用，整数赋值，无堆分配
+  → 未命中: new TypedMessage<T>   // 首次创建
+  → raw->recycler_ = &recycle     // 设置回收回调
   → queue_.try_enqueue(MessagePtr::adopt(raw))
 ```
 
@@ -254,7 +260,38 @@ MessagePtr 引用计数归零
 
 ---
 
-### 4.5 TopicMatcher — MQTT 风格通配符
+### 4.5 TopicRegistry — Topic 字符串 ↔ ID 注册表
+
+**文件**: `include/msgbus/topic_registry.h`
+
+线程安全的 topic 字符串与整数 ID 双向映射。所有热路径（dispatch、route）使用 `TopicId`（`uint32_t`）代替 `std::string` 进行哈希和比较。
+
+```cpp
+class TopicRegistry {
+public:
+    TopicId resolve(std::string_view topic);      // 注册或查找 topic → 稳定 ID
+    std::string_view to_string(TopicId id) const; // 反查 ID → 字符串（如通配符匹配时）
+};
+```
+
+**关键设计**：
+
+| 特性 | 实现 |
+|------|------|
+| 读路径 | `shared_lock` + 透明哈希查找（`string_view` 查 `string` 键，零分配） |
+| 写路径 | `unique_lock` + double-check，仅首次注册时触发 |
+| ID 稳定性 | 递增分配，`kInvalidTopicId = 0`，合法 ID 从 1 开始 |
+| 字符串生命周期 | `id_to_sv_` 存储的 `string_view` 指向 `unordered_map` 键（迭代器稳定性保证） |
+
+**收益**：
+* dispatch 路径 `slots_` 和 `topic_types_` 从 `unordered_map<string, ...>` 变为 `unordered_map<uint32_t, ...>`
+* 路由 `routeToWorker` 使用 `hash<TopicId>` 代替 `hash<string>`
+* `TypedMessage<T>` 仅携带 4 字节 `TopicId` 而非 `std::string`
+* 多 Topic QPS 提升 ~26%，p50 延迟降低 ~6x
+
+---
+
+### 4.6 TopicMatcher — MQTT 风格通配符
 
 **文件**: `include/msgbus/topic_matcher.h`
 
@@ -277,7 +314,7 @@ bool isWildcard(std::string_view pattern);
 
 ---
 
-### 4.6 TopicSlot — COW 订阅管理
+### 4.7 TopicSlot — COW 订阅管理
 
 **文件**: `include/msgbus/topic_slot.h`
 
@@ -312,7 +349,7 @@ dispatch 时:
 
 ---
 
-### 4.7 MessageBus — 核心总线
+### 4.8 MessageBus — 核心总线
 
 **文件**: `include/msgbus/message_bus.h`
 
@@ -350,9 +387,9 @@ public:
 **消息分发（dispatchMessage）**：
 
 ```
-1. 精确匹配: slots_[topic] → TopicSlot<T>::dispatch()
-2. 通配符匹配: 遍历 wildcard_entries_，topicMatches(pattern, topic)
-   → 匹配成功的 WildcardEntry::slot->dispatch()
+1. 精确匹配: slots_[topic_id] → TopicSlot<T>::dispatch()（整数哈希查找）
+2. 通配符匹配: registry_.to_string(topic_id) → 遍历 wildcard_entries_
+   → topicMatches(pattern, topic_sv) → WildcardEntry::slot->dispatch()
 ```
 
 **单线程 Dispatcher（num_dispatchers == 1）**：
@@ -371,7 +408,7 @@ dispatchLoop():
 架构: 1 Router 线程 + N Worker 线程
 
 Router 线程 (routerLoop):
-  从主队列 dequeue → hash(topic) % N → 入 worker_queues_[N]
+  从主队列 dequeue → hash(topic_id) % N → 入 worker_queues_[N]
   相同 topic 的消息总是路由到同一 worker（保序）
 
 Worker 线程 (workerLoop):
@@ -379,7 +416,7 @@ Worker 线程 (workerLoop):
   每个 worker 独立退避策略
 ```
 
-**保序保证**：同一 topic 的消息通过 hash 分片始终路由到同一 worker，保证该 topic 内的投递顺序。
+**保序保证**：同一 topic 的消息通过 hash(topic_id) 分片始终路由到同一 worker，保证该 topic 内的投递顺序。
 
 **优雅关闭**（安全时序）：
 
@@ -396,7 +433,7 @@ Worker 在 `running_=false` 后进入等待循环，直到 `router_drained_=true
 
 ---
 
-### 4.8 AsyncWaitAwaitable — 协程支持
+### 4.9 AsyncWaitAwaitable — 协程支持
 
 ```cpp
 template <typename T>
@@ -431,14 +468,15 @@ co_await bus.async_wait<T>(topic)
 
 | 操作 | 锁级别 | 说明 |
 |------|--------|------|
-| `publish` | **完全无锁** | 对象池 acquire + 原子 CAS 入队 |
+| `publish` | shared_lock | TopicRegistry resolve + 对象池 acquire + 原子 CAS 入队 |
 | `subscribe` (精确) | mutex (COW) | 低频操作，复制整个列表 |
 | `subscribe` (通配符) | shared_mutex 写锁 | 追加 WildcardEntry |
 | `unsubscribe` | mutex / shared_mutex | 同上 |
-| `dispatch` (精确) | **读无锁** | 仅 shared_ptr 拷贝加锁，遍历无锁 |
+| `dispatch` (精确) | **读无锁** | TopicId 整数哈希查找，仅 shared_ptr 拷贝加锁，遍历无锁 |
 | `dispatch` (通配符) | shared_mutex 读锁 | 遍历 wildcard_entries_ 匹配 |
-| Topic 查找 | shared_mutex 读锁 | 哈希表查找，读多写少 |
-| Router 路由 | **完全无锁** | hash + CAS 入 worker 队列 |
+| Topic 查找 | shared_mutex 读锁 | TopicId 整数键哈希表查找，读多写少 |
+| TopicRegistry resolve | shared_lock / unique_lock | 已注册只需 shared_lock，首次注册 unique_lock |
+| Router 路由 | **完全无锁** | hash(TopicId) + CAS 入 worker 队列 |
 
 ### 5.2 内存管理
 
@@ -462,8 +500,8 @@ co_await bus.async_wait<T>(topic)
 
 | 路径 | 复杂度 | 锁 | 优化 |
 |------|--------|----|------|
-| publish → pool acquire → enqueue | O(1) | 无锁 | 对象池避免堆分配 |
-| dequeue → dispatch | O(subscribers + wildcards) | 读无锁/读锁 | COW 快照 |
+| publish → registry resolve → pool acquire → enqueue | O(1) | shared_lock + 无锁 | TopicId 整数赋值 + 对象池避免堆分配 |
+| dequeue → dispatch | O(subscribers + wildcards) | 读无锁/读锁 | TopicId 整数哈希 + COW 快照 |
 | subscribe | O(n) copy | mutex | 低频，COW |
 
 ### 缓存友好
@@ -477,6 +515,7 @@ co_await bus.async_wait<T>(topic)
 * 侵入式引用计数：消除 `shared_ptr` 独立 control block 的堆分配
 * 对象池 + `reset()`：消息对象复用，避免构造/析构开销
 * recycler 函数指针：零虚函数开销的回收路径
+* TopicId 整数路由：dispatch/route 路径上用 `uint32_t` 替代 `std::string` 哈希/比较
 
 ---
 
@@ -487,6 +526,7 @@ co_await bus.async_wait<T>(topic)
 | ~~多线程 dispatcher~~ | ~~P2~~ | ✅ 已实现 | 按 topic hash 分片到线程池 |
 | ~~Zero-copy 优化~~ | ~~P3~~ | ✅ 已实现 | 对象池 + 侵入式引用计数 |
 | ~~Topic 通配符~~ | ~~P3~~ | ✅ 已实现 | MQTT 风格 `*` / `#` |
+| ~~TopicId 整数路由~~ | ~~P2~~ | ✅ 已实现 | TopicRegistry + uint32_t 替代 string，多 Topic +26% |
 | Backpressure | P2 | 待实现 | publish 返回 false 时限流策略 |
 | Batch 消费 | P2 | 待实现 | 一次 dequeue 多条，减少调度开销 |
 | 优先级队列 | P3 | 待实现 | 消息优先级 |
@@ -511,6 +551,13 @@ co_await bus.async_wait<T>(topic)
 - [x] 实现 TypedMessagePool 每类型静态池
 - [x] publish 路径对象复用（acquire → reset → enqueue）
 - [x] 引用计数归零自动回收到池
+
+### TopicId 整数路由
+- [x] 实现 TopicRegistry（线程安全双向映射，shared_mutex 读写分离）
+- [x] IMessage::topic_id() 替代 topic()，TypedMessage 携带 uint32_t
+- [x] slots_ / topic_types_ 以 TopicId 为键（整数哈希）
+- [x] routeToWorker 使用 hash(TopicId) 路由
+- [x] 通配符 unsubscribe 无需反查字符串（SubInfo 标志区分）
 
 ### 多 Dispatcher
 - [x] 实现 Router 线程（hash 分片路由）
@@ -545,7 +592,7 @@ co_await bus.async_wait<T>(topic)
 - [ ] metrics（队列长度、延迟）
 
 ### 工程化
-- [x] 单元测试（55 个 GTest 用例）
+- [x] 单元测试（59 个 GTest 用例）
 - [x] 代码覆盖率统计（OpenCppCoverage / lcov，96.1%）
 - [x] 性能压测（6 个基准场景）
 - [x] GitHub Actions CI（Windows/Linux/macOS，UT 门禁）

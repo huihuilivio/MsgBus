@@ -1,6 +1,7 @@
 #include "msgbus/message_bus.h"
 #include "msgbus/object_pool.h"
 #include "msgbus/topic_matcher.h"
+#include "msgbus/topic_registry.h"
 
 #include <gtest/gtest.h>
 
@@ -14,6 +15,53 @@
 
 using namespace msgbus;
 
+// ---------- TopicRegistry Tests ----------
+
+TEST(TopicRegistryTest, ResolveAndToString) {
+    TopicRegistry reg;
+    TopicId id1 = reg.resolve("sensor/temp");
+    TopicId id2 = reg.resolve("sensor/humidity");
+    EXPECT_NE(id1, kInvalidTopicId);
+    EXPECT_NE(id2, kInvalidTopicId);
+    EXPECT_NE(id1, id2);
+    EXPECT_EQ(reg.to_string(id1), "sensor/temp");
+    EXPECT_EQ(reg.to_string(id2), "sensor/humidity");
+}
+
+TEST(TopicRegistryTest, SameTopicSameId) {
+    TopicRegistry reg;
+    TopicId a = reg.resolve("x/y");
+    TopicId b = reg.resolve("x/y");
+    EXPECT_EQ(a, b);
+}
+
+TEST(TopicRegistryTest, InvalidIdReturnsEmpty) {
+    TopicRegistry reg;
+    EXPECT_TRUE(reg.to_string(999).empty());
+}
+
+TEST(TopicRegistryTest, ConcurrentResolve) {
+    TopicRegistry reg;
+    constexpr int THREADS = 8;
+    constexpr int PER_THREAD = 100;
+    std::vector<std::thread> threads;
+    std::vector<TopicId> ids(THREADS * PER_THREAD);
+
+    for (int t = 0; t < THREADS; ++t) {
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < PER_THREAD; ++i) {
+                std::string topic = "t/" + std::to_string(t) + "/" + std::to_string(i);
+                ids[t * PER_THREAD + i] = reg.resolve(topic);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    // All IDs should be unique (no duplicates for different topics)
+    std::set<TopicId> unique_ids(ids.begin(), ids.end());
+    EXPECT_EQ(unique_ids.size(), static_cast<size_t>(THREADS * PER_THREAD));
+}
+
 // ---------- MessagePtr Tests ----------
 
 TEST(MessagePtrTest, DefaultNull) {
@@ -23,16 +71,16 @@ TEST(MessagePtrTest, DefaultNull) {
 }
 
 TEST(MessagePtrTest, AdoptAndAccess) {
-    auto* raw = new TypedMessage<int>("t", 42);
+    auto* raw = new TypedMessage<int>(1, 42);
     MessagePtr ptr = MessagePtr::adopt(raw);
     EXPECT_TRUE(ptr);
-    EXPECT_EQ(ptr->topic(), "t");
+    EXPECT_EQ(ptr->topic_id(), 1u);
     EXPECT_EQ(ptr->type(), typeid(int));
     EXPECT_EQ(static_cast<TypedMessage<int>*>(ptr.get())->data_, 42);
 }
 
 TEST(MessagePtrTest, CopyIncrementsRefCount) {
-    auto* raw = new TypedMessage<int>("t", 1);
+    auto* raw = new TypedMessage<int>(1, 1);
     MessagePtr p1 = MessagePtr::adopt(raw);
     {
         MessagePtr p2 = p1; // copy
@@ -44,7 +92,7 @@ TEST(MessagePtrTest, CopyIncrementsRefCount) {
 }
 
 TEST(MessagePtrTest, MoveTransfersOwnership) {
-    auto* raw = new TypedMessage<int>("t", 1);
+    auto* raw = new TypedMessage<int>(1, 1);
     MessagePtr p1 = MessagePtr::adopt(raw);
     MessagePtr p2 = std::move(p1);
     EXPECT_FALSE(p1);
@@ -54,8 +102,8 @@ TEST(MessagePtrTest, MoveTransfersOwnership) {
 }
 
 TEST(MessagePtrTest, CopyAssignment) {
-    auto* r1 = new TypedMessage<int>("a", 1);
-    auto* r2 = new TypedMessage<int>("b", 2);
+    auto* r1 = new TypedMessage<int>(1, 1);
+    auto* r2 = new TypedMessage<int>(2, 2);
     MessagePtr p1 = MessagePtr::adopt(r1);
     MessagePtr p2 = MessagePtr::adopt(r2);
     p2 = p1;
@@ -65,8 +113,8 @@ TEST(MessagePtrTest, CopyAssignment) {
 }
 
 TEST(MessagePtrTest, MoveAssignment) {
-    auto* r1 = new TypedMessage<int>("a", 1);
-    auto* r2 = new TypedMessage<int>("b", 2);
+    auto* r1 = new TypedMessage<int>(1, 1);
+    auto* r2 = new TypedMessage<int>(2, 2);
     MessagePtr p1 = MessagePtr::adopt(r1);
     MessagePtr p2 = MessagePtr::adopt(r2);
     p2 = std::move(p1);
@@ -76,7 +124,7 @@ TEST(MessagePtrTest, MoveAssignment) {
 }
 
 TEST(MessagePtrTest, SelfCopyAssignment) {
-    auto* raw = new TypedMessage<int>("t", 1);
+    auto* raw = new TypedMessage<int>(1, 1);
     MessagePtr p = MessagePtr::adopt(raw);
     auto& ref = p;
     p = ref; // self-copy
@@ -85,7 +133,7 @@ TEST(MessagePtrTest, SelfCopyAssignment) {
 }
 
 TEST(MessagePtrTest, SelfMoveAssignment) {
-    auto* raw = new TypedMessage<int>("t", 1);
+    auto* raw = new TypedMessage<int>(1, 1);
     MessagePtr p = MessagePtr::adopt(raw);
     auto& ref = p;
     p = std::move(ref); // self-move
@@ -95,7 +143,7 @@ TEST(MessagePtrTest, SelfMoveAssignment) {
 
 TEST(MessagePtrTest, RecyclerCalledOnDestroy) {
     bool recycled = false;
-    auto* raw = new TypedMessage<int>("t", 1);
+    auto* raw = new TypedMessage<int>(1, 1);
     raw->recycler_ = [](IMessage* msg) {
         // Just delete — the test verifies the callback is invoked
         *static_cast<bool*>(
@@ -115,7 +163,7 @@ TEST(MessagePtrTest, RecyclerCalledOnDestroy) {
 }
 
 TEST(MessagePtrTest, ResetToNull) {
-    auto* raw = new TypedMessage<int>("t", 1);
+    auto* raw = new TypedMessage<int>(1, 1);
     MessagePtr p = MessagePtr::adopt(raw);
     EXPECT_TRUE(p);
     p.reset();
@@ -131,20 +179,20 @@ TEST(MessagePtrTest, AdoptNull) {
 // ---------- TypedMessage Tests ----------
 
 TEST(TypedMessageTest, Construction) {
-    TypedMessage<std::string> msg("my/topic", "hello");
-    EXPECT_EQ(msg.topic(), "my/topic");
+    TypedMessage<std::string> msg(1, "hello");
+    EXPECT_EQ(msg.topic_id(), 1u);
     EXPECT_EQ(msg.data_, "hello");
     EXPECT_EQ(msg.type(), typeid(std::string));
 }
 
 TEST(TypedMessageTest, ResetForReuse) {
-    auto* msg = new TypedMessage<int>("old", 1);
+    auto* msg = new TypedMessage<int>(1, 1);
     msg->ref_count_.store(5, std::memory_order_relaxed);
     msg->recycler_ = reinterpret_cast<void(*)(IMessage*)>(0xDEAD); // dummy
 
-    msg->reset("new", 99);
+    msg->reset(2, 99);
 
-    EXPECT_EQ(msg->topic(), "new");
+    EXPECT_EQ(msg->topic_id(), 2u);
     EXPECT_EQ(msg->data_, 99);
     EXPECT_EQ(msg->ref_count_.load(), 0);
     EXPECT_EQ(msg->recycler_, nullptr);
@@ -160,7 +208,7 @@ TEST(ObjectPoolTest, AcquireFromEmpty) {
 
 TEST(ObjectPoolTest, ReleaseAndAcquire) {
     ObjectPool<TypedMessage<int>> pool(4);
-    auto* obj = new TypedMessage<int>("t", 42);
+    auto* obj = new TypedMessage<int>(1, 42);
     pool.release(obj);
     auto* recycled = pool.acquire();
     EXPECT_EQ(recycled, obj);
@@ -170,9 +218,9 @@ TEST(ObjectPoolTest, ReleaseAndAcquire) {
 
 TEST(ObjectPoolTest, FullPoolDeletesObject) {
     ObjectPool<TypedMessage<int>> pool(2); // capacity 2
-    auto* a = new TypedMessage<int>("a", 1);
-    auto* b = new TypedMessage<int>("b", 2);
-    auto* c = new TypedMessage<int>("c", 3);
+    auto* a = new TypedMessage<int>(1, 1);
+    auto* b = new TypedMessage<int>(2, 2);
+    auto* c = new TypedMessage<int>(3, 3);
 
     pool.release(a);
     pool.release(b);
@@ -194,8 +242,8 @@ TEST(ObjectPoolTest, RecycleViaMessagePtr) {
     // Publish a message, let it be destroyed → should be recycled to pool
     {
         auto* raw = pool.acquire();
-        if (!raw) raw = new TypedMessage<int>("test", 0);
-        raw->reset("pool/test", 77);
+        if (!raw) raw = new TypedMessage<int>(1, 0);
+        raw->reset(2, 77);
         raw->recycler_ = &TypedMessagePool<int>::recycle;
         MessagePtr ptr = MessagePtr::adopt(raw);
         // ptr goes out of scope → recycler called → back in pool
@@ -204,7 +252,7 @@ TEST(ObjectPoolTest, RecycleViaMessagePtr) {
     EXPECT_NE(recycled, nullptr);
     if (recycled) {
         // The recycled object should exist (we can reuse it)
-        recycled->reset("reused", 100);
+        recycled->reset(3, 100);
         EXPECT_EQ(recycled->data_, 100);
         pool.release(recycled);
     }

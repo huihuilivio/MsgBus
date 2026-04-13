@@ -94,8 +94,9 @@ MsgBus/
 │       ├── object_pool.h              # Lock-free object pool (freelist recycling)
 │       ├── subscriber.h               # Subscriber<T> definition
 │       ├── topic_matcher.h            # MQTT-style topic wildcard matching
+│       ├── topic_registry.h           # TopicId ↔ string thread-safe registry
 │       ├── topic_slot.h               # TopicSlot<T> COW subscription management
-│       └── message_bus.h              # MessageBus core + pool + multi-dispatcher + wildcards + coroutines
+│       └── message_bus.h              # MessageBus core + pool + multi-dispatcher + wildcards + coroutines + TopicRegistry
 ├── examples/
 │   ├── CMakeLists.txt
 │   ├── basic_example.cpp              # Basic pub/sub example
@@ -103,7 +104,7 @@ MsgBus/
 │   └── wildcard_example.cpp           # Wildcard subscription example
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # Unit tests (55 GTest cases)
+│   ├── test_message_bus.cpp            # Unit tests (59 GTest cases)
 │   └── bench_message_bus.cpp           # Benchmarks (6 scenarios)
 └── .github/
     └── workflows/
@@ -174,11 +175,15 @@ public:
 **File**: `include/msgbus/message.h`
 
 ```cpp
+/// Compact topic identifier — replaces std::string on the hot path.
+using TopicId = uint32_t;
+inline constexpr TopicId kInvalidTopicId = 0;
+
 struct IMessage {
     std::atomic<int> ref_count_{0};         // Intrusive reference count
     void (*recycler_)(IMessage*) = nullptr; // Recycle function pointer
 
-    virtual const std::string& topic();
+    virtual TopicId topic_id();
     virtual const std::type_info& type();
     void add_ref() noexcept;
     bool release_ref() noexcept;            // Returns true when count reaches zero
@@ -186,9 +191,9 @@ struct IMessage {
 
 template <typename T>
 struct TypedMessage : IMessage {
-    std::string topic_;
+    TopicId topic_id_;
     T data_;
-    void reset(const std::string& topic, T data); // Reset for pool reuse
+    void reset(TopicId topic_id, T data); // Reset for pool reuse (integer assign instead of string copy)
 };
 ```
 
@@ -207,8 +212,8 @@ public:
 
 * **Replaces `shared_ptr`**: Eliminates separate control block heap allocation; ref count embedded in IMessage
 * **Recycler function pointer**: Set during publish; called when ref count reaches zero to return object to pool instead of delete
-* **`reset()` method**: Resets topic/data/ref_count/recycler for pool reuse, avoiding destruct+construct overhead
-* Performance gain: Minimum latency from ~36μs down to ~0.3μs
+* **`reset()` method**: Resets topic_id/data/ref_count/recycler for pool reuse, integer assign instead of string copy
+* Performance gain: Minimum latency from ~36μs down to ~0.6μs
 
 ---
 
@@ -235,10 +240,11 @@ struct TypedMessagePool {
 
 ```
 publish<T>(topic, msg)
+  → registry_.resolve(topic) → TopicId  // string→integer (shared_lock fast path)
   → pool.acquire()
-  → hit:  reset(topic, msg)    // Reuse, no heap allocation
-  → miss: new TypedMessage<T>  // First-time creation
-  → raw->recycler_ = &recycle  // Set recycle callback
+  → hit:  reset(topic_id, msg)    // Reuse, integer assign, no heap allocation
+  → miss: new TypedMessage<T>     // First-time creation
+  → raw->recycler_ = &recycle     // Set recycle callback
   → queue_.try_enqueue(MessagePtr::adopt(raw))
 ```
 
@@ -254,7 +260,38 @@ MessagePtr ref count reaches zero
 
 ---
 
-### 4.5 TopicMatcher — MQTT-Style Wildcards
+### 4.5 TopicRegistry — Topic String ↔ ID Registry
+
+**File**: `include/msgbus/topic_registry.h`
+
+Thread-safe bidirectional mapping between topic strings and integer IDs. All hot paths (dispatch, route) use `TopicId` (`uint32_t`) instead of `std::string` for hashing and comparison.
+
+```cpp
+class TopicRegistry {
+public:
+    TopicId resolve(std::string_view topic);      // Register or look up topic → stable ID
+    std::string_view to_string(TopicId id) const; // Reverse lookup ID → string (e.g. for wildcard matching)
+};
+```
+
+**Key Design**:
+
+| Feature | Implementation |
+|---|---|
+| Read path | `shared_lock` + transparent hash lookup (`string_view` into `string` keys, zero allocation) |
+| Write path | `unique_lock` + double-check, only triggered on first registration |
+| ID stability | Monotonically incrementing, `kInvalidTopicId = 0`, valid IDs start from 1 |
+| String lifetime | `id_to_sv_` stores `string_view` pointing into `unordered_map` keys (iterator stability guarantee) |
+
+**Benefits**:
+* dispatch path `slots_` and `topic_types_` changed from `unordered_map<string, ...>` to `unordered_map<uint32_t, ...>`
+* Routing via `hash<TopicId>` instead of `hash<string>` in `routeToWorker`
+* `TypedMessage<T>` carries only 4-byte `TopicId` instead of `std::string`
+* Multi-topic QPS improved ~26%, p50 latency reduced ~6x
+
+---
+
+### 4.6 TopicMatcher — MQTT-Style Wildcards
 
 **File**: `include/msgbus/topic_matcher.h`
 
@@ -277,7 +314,7 @@ bool isWildcard(std::string_view pattern);
 
 ---
 
-### 4.6 TopicSlot — COW Subscription Management
+### 4.7 TopicSlot — COW Subscription Management
 
 **File**: `include/msgbus/topic_slot.h`
 
@@ -312,7 +349,7 @@ dispatch:
 
 ---
 
-### 4.7 MessageBus — Core Bus
+### 4.8 MessageBus — Core Bus
 
 **File**: `include/msgbus/message_bus.h`
 
@@ -350,9 +387,9 @@ public:
 **Message Dispatch (dispatchMessage)**:
 
 ```
-1. Exact match: slots_[topic] → TopicSlot<T>::dispatch()
-2. Wildcard match: iterate wildcard_entries_, topicMatches(pattern, topic)
-   → Matched WildcardEntry::slot->dispatch()
+1. Exact match: slots_[topic_id] → TopicSlot<T>::dispatch() (integer hash lookup)
+2. Wildcard match: registry_.to_string(topic_id) → iterate wildcard_entries_
+   → topicMatches(pattern, topic_sv) → WildcardEntry::slot->dispatch()
 ```
 
 **Single-Thread Dispatcher (num_dispatchers == 1)**:
@@ -371,7 +408,7 @@ dispatchLoop():
 Architecture: 1 Router thread + N Worker threads
 
 Router thread (routerLoop):
-  Dequeue from main queue → hash(topic) % N → enqueue to worker_queues_[N]
+  Dequeue from main queue → hash(topic_id) % N → enqueue to worker_queues_[N]
   Same topic always routes to same worker (ordering guarantee)
 
 Worker thread (workerLoop):
@@ -379,7 +416,7 @@ Worker thread (workerLoop):
   Each worker has independent backoff strategy
 ```
 
-**Ordering Guarantee**: Messages on the same topic are hash-sharded to the same worker, guaranteeing in-order delivery within that topic.
+**Ordering Guarantee**: Messages on the same topic are hash-sharded via hash(topic_id) to the same worker, guaranteeing in-order delivery within that topic.
 
 **Graceful Shutdown** (safe sequence):
 
@@ -396,7 +433,7 @@ Workers enter a wait loop after `running_=false`, only doing final drain and exi
 
 ---
 
-### 4.8 AsyncWaitAwaitable — Coroutine Support
+### 4.9 AsyncWaitAwaitable — Coroutine Support
 
 ```cpp
 template <typename T>
@@ -431,14 +468,15 @@ co_await bus.async_wait<T>(topic)
 
 | Operation | Lock Level | Notes |
 |---|---|---|
-| `publish` | **Fully lock-free** | Pool acquire + atomic CAS enqueue |
+| `publish` | shared_lock | TopicRegistry resolve + pool acquire + atomic CAS enqueue |
 | `subscribe` (exact) | mutex (COW) | Low-frequency, copies entire list |
 | `subscribe` (wildcard) | shared_mutex write lock | Append WildcardEntry |
 | `unsubscribe` | mutex / shared_mutex | Same as above |
-| `dispatch` (exact) | **Read lock-free** | Only shared_ptr copy under lock; iteration lock-free |
+| `dispatch` (exact) | **Read lock-free** | TopicId integer hash lookup; only shared_ptr copy under lock; iteration lock-free |
 | `dispatch` (wildcard) | shared_mutex read lock | Iterate wildcard_entries_ for matching |
-| Topic lookup | shared_mutex read lock | Hash table lookup, read-heavy |
-| Router routing | **Fully lock-free** | hash + CAS into worker queue |
+| Topic lookup | shared_mutex read lock | TopicId integer-key hash table lookup, read-heavy |
+| TopicRegistry resolve | shared_lock / unique_lock | Already registered: shared_lock only; first registration: unique_lock |
+| Router routing | **Fully lock-free** | hash(TopicId) + CAS into worker queue |
 
 ### 5.2 Memory Management
 
@@ -462,8 +500,8 @@ co_await bus.async_wait<T>(topic)
 
 | Path | Complexity | Lock | Optimization |
 |---|---|---|---|
-| publish → pool acquire → enqueue | O(1) | Lock-free | Object pool avoids heap allocation |
-| dequeue → dispatch | O(subscribers + wildcards) | Read lock-free / read lock | COW snapshot |
+| publish → registry resolve → pool acquire → enqueue | O(1) | shared_lock + lock-free | TopicId integer assign + object pool avoids heap allocation |
+| dequeue → dispatch | O(subscribers + wildcards) | Read lock-free / read lock | TopicId integer hash + COW snapshot |
 | subscribe | O(n) copy | mutex | Low-frequency, COW |
 
 ### Cache Friendliness
@@ -477,6 +515,7 @@ co_await bus.async_wait<T>(topic)
 * Intrusive ref counting: eliminates `shared_ptr` separate control block heap allocation
 * Object pool + `reset()`: message object reuse avoids construct/destruct overhead
 * Recycler function pointer: zero virtual function overhead recycle path
+* TopicId integer routing: dispatch/route paths use `uint32_t` instead of `std::string` hash/compare
 
 ---
 
@@ -487,6 +526,7 @@ co_await bus.async_wait<T>(topic)
 | ~~Multi-thread dispatcher~~ | ~~P2~~ | ✅ Done | Topic hash sharding to thread pool |
 | ~~Zero-copy optimization~~ | ~~P3~~ | ✅ Done | Object pool + intrusive ref count |
 | ~~Topic wildcards~~ | ~~P3~~ | ✅ Done | MQTT-style `*` / `#` |
+| ~~TopicId integer routing~~ | ~~P2~~ | ✅ Done | TopicRegistry + uint32_t replaces string, multi-topic +26% |
 | Backpressure | P2 | Planned | Rate limiting strategy when publish returns false |
 | Batch consumption | P2 | Planned | Dequeue multiple at once, reduce scheduling overhead |
 | Priority queue | P3 | Planned | Message priorities |
@@ -511,6 +551,13 @@ co_await bus.async_wait<T>(topic)
 - [x] TypedMessagePool per-type static pool
 - [x] Publish path object reuse (acquire → reset → enqueue)
 - [x] Automatic pool recycling on ref count zero
+
+### TopicId Integer Routing
+- [x] TopicRegistry (thread-safe bidirectional mapping, shared_mutex read-write separation)
+- [x] IMessage::topic_id() replaces topic(), TypedMessage carries uint32_t
+- [x] slots_ / topic_types_ keyed by TopicId (integer hash)
+- [x] routeToWorker uses hash(TopicId) routing
+- [x] Wildcard unsubscribe without string reverse lookup (SubInfo flag distinction)
 
 ### Multi-Dispatcher
 - [x] Router thread (hash sharding)
@@ -545,7 +592,7 @@ co_await bus.async_wait<T>(topic)
 - [ ] Metrics (queue depth, latency)
 
 ### Engineering
-- [x] Unit tests (55 GTest cases)
+- [x] Unit tests (59 GTest cases)
 - [x] Code coverage (OpenCppCoverage / lcov, 96.1%)
 - [x] Benchmarks (6 scenarios)
 - [x] GitHub Actions CI (Windows/Linux/macOS, UT gate)

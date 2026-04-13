@@ -5,6 +5,7 @@
 #include "msgbus/object_pool.h"
 #include "msgbus/subscriber.h"
 #include "msgbus/topic_matcher.h"
+#include "msgbus/topic_registry.h"
 #include "msgbus/topic_slot.h"
 
 #include <atomic>
@@ -108,12 +109,13 @@ public:
     /// Publish a message to a topic. Returns false if queue is full.
     template <typename T>
     bool publish(const std::string& topic, T msg) {
+        TopicId tid = registry_.resolve(topic);
         auto& pool = TypedMessagePool<T>::instance();
         TypedMessage<T>* raw = pool.acquire();
         if (raw) {
-            raw->reset(topic, std::move(msg));
+            raw->reset(tid, std::move(msg));
         } else {
-            raw = new TypedMessage<T>(topic, std::move(msg));
+            raw = new TypedMessage<T>(tid, std::move(msg));
         }
         raw->recycler_ = &TypedMessagePool<T>::recycle;
         return queue_.try_enqueue(MessagePtr::adopt(raw));
@@ -127,36 +129,40 @@ public:
         auto id = next_id_.fetch_add(1, std::memory_order_relaxed) + 1;
 
         if (isWildcard(topic)) {
-            // Wildcard subscription: store pattern + slot
+            // Wildcard subscription: store pattern + slot (no TopicId needed)
             auto slot = std::make_shared<TopicSlot<T>>();
             slot->addSubscriber(
                 std::function<void(const T&)>(std::forward<Handler>(handler)), id);
 
             std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
             wildcard_entries_.push_back({topic, &typeid(T), slot, id});
+
+            std::lock_guard<std::mutex> lk(sub_map_mutex_);
+            sub_to_topic_[id] = {kInvalidTopicId, true};
         } else {
-            auto* slot = getOrCreateSlot<T>(topic);
+            TopicId tid = registry_.resolve(topic);
+            auto* slot = getOrCreateSlot<T>(tid);
             slot->addSubscriber(
                 std::function<void(const T&)>(std::forward<Handler>(handler)), id);
-        }
 
-        std::lock_guard<std::mutex> lock(sub_map_mutex_);
-        sub_to_topic_[id] = topic;
+            std::lock_guard<std::mutex> lk(sub_map_mutex_);
+            sub_to_topic_[id] = {tid, false};
+        }
         return id;
     }
 
     /// Unsubscribe by subscription ID.
     void unsubscribe(SubscriptionId id) {
-        std::string topic;
+        SubInfo info;
         {
             std::lock_guard<std::mutex> lock(sub_map_mutex_);
             auto it = sub_to_topic_.find(id);
             if (it == sub_to_topic_.end()) return;
-            topic = it->second;
+            info = it->second;
             sub_to_topic_.erase(it);
         }
 
-        if (isWildcard(topic)) {
+        if (info.is_wildcard) {
             std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
             for (auto it = wildcard_entries_.begin(); it != wildcard_entries_.end(); ++it) {
                 if (it->sub_id == id) {
@@ -169,7 +175,7 @@ public:
             ITopicSlot* slot = nullptr;
             {
                 std::shared_lock<std::shared_mutex> lock(slots_mutex_);
-                auto it = slots_.find(topic);
+                auto it = slots_.find(info.tid);
                 if (it != slots_.end()) {
                     slot = it->second.get();
                 }
@@ -232,48 +238,53 @@ public:
     /// Returns the number of dispatcher threads.
     unsigned dispatcher_count() const { return num_dispatchers_; }
 
+    /// Access the topic registry (e.g. to resolve TopicId ↔ string).
+    TopicRegistry& registry() { return registry_; }
+    const TopicRegistry& registry() const { return registry_; }
+
 private:
     template <typename T>
-    TopicSlot<T>* getOrCreateSlot(const std::string& topic) {
+    TopicSlot<T>* getOrCreateSlot(TopicId tid) {
         {
             std::shared_lock<std::shared_mutex> lock(slots_mutex_);
-            auto it = slots_.find(topic);
+            auto it = slots_.find(tid);
             if (it != slots_.end()) {
-                auto type_it = topic_types_.find(topic);
+                auto type_it = topic_types_.find(tid);
                 if (type_it != topic_types_.end() &&
                     *type_it->second != typeid(T)) {
                     throw std::runtime_error(
-                        "Type mismatch for topic: " + topic);
+                        "Type mismatch for topic: " + std::string(registry_.to_string(tid)));
                 }
                 return static_cast<TopicSlot<T>*>(it->second.get());
             }
         }
 
         std::unique_lock<std::shared_mutex> lock(slots_mutex_);
-        auto it = slots_.find(topic);
+        auto it = slots_.find(tid);
         if (it != slots_.end()) {
-            auto type_it = topic_types_.find(topic);
+            auto type_it = topic_types_.find(tid);
             if (type_it != topic_types_.end() &&
                 *type_it->second != typeid(T)) {
-                throw std::runtime_error("Type mismatch for topic: " + topic);
+                throw std::runtime_error("Type mismatch for topic: " + std::string(registry_.to_string(tid)));
             }
             return static_cast<TopicSlot<T>*>(it->second.get());
         }
 
         auto slot = std::make_unique<TopicSlot<T>>();
         auto* ptr = slot.get();
-        slots_[topic] = std::move(slot);
-        topic_types_[topic] = &typeid(T);
+        slots_[tid] = std::move(slot);
+        topic_types_[tid] = &typeid(T);
         return ptr;
     }
 
     void dispatchMessage(const MessagePtr& msg) {
-        // 1. Exact-match dispatch
+        TopicId tid = msg->topic_id();
+        // 1. Exact-match dispatch (integer hash lookup)
         {
             std::shared_lock<std::shared_mutex> lock(slots_mutex_);
-            auto it = slots_.find(msg->topic());
+            auto it = slots_.find(tid);
             if (it != slots_.end()) {
-                auto type_it = topic_types_.find(msg->topic());
+                auto type_it = topic_types_.find(tid);
                 if (type_it != topic_types_.end() &&
                     *type_it->second == msg->type()) {
                     it->second->dispatch(msg);
@@ -281,13 +292,16 @@ private:
             }
         }
 
-        // 2. Wildcard-match dispatch
+        // 2. Wildcard-match dispatch (resolve ID → string_view for matching)
         {
             std::shared_lock<std::shared_mutex> lock(wildcards_mutex_);
-            for (auto& entry : wildcard_entries_) {
-                if (*entry.type == msg->type() &&
-                    topicMatches(entry.pattern, msg->topic())) {
-                    entry.slot->dispatch(msg);
+            if (!wildcard_entries_.empty()) {
+                std::string_view topic_sv = registry_.to_string(tid);
+                for (auto& entry : wildcard_entries_) {
+                    if (*entry.type == msg->type() &&
+                        topicMatches(entry.pattern, topic_sv)) {
+                        entry.slot->dispatch(msg);
+                    }
                 }
             }
         }
@@ -325,13 +339,12 @@ private:
     /// Router thread: dequeue from main queue, hash-route to worker queues.
     /// Messages with the same topic always go to the same worker (ordering guarantee).
     void routerLoop() {
-        std::hash<std::string> hasher;
         unsigned idle = 0;
         while (running_.load(std::memory_order_relaxed)) {
             MessagePtr msg;
             if (queue_.try_dequeue(msg)) {
                 idle = 0;
-                routeToWorker(hasher, msg);
+                routeToWorker(msg);
             } else {
                 if (idle < kSpinThreshold) {
                     ++idle;
@@ -348,12 +361,12 @@ private:
         // Workers are still alive (stop() joins router before workers).
         MessagePtr msg;
         while (queue_.try_dequeue(msg)) {
-            routeToWorker(hasher, msg);
+            routeToWorker(msg);
         }
     }
 
-    void routeToWorker(std::hash<std::string>& hasher, const MessagePtr& msg) {
-        size_t idx = hasher(msg->topic()) % num_dispatchers_;
+    void routeToWorker(const MessagePtr& msg) {
+        size_t idx = std::hash<TopicId>{}(msg->topic_id()) % num_dispatchers_;
         while (!worker_queues_[idx]->try_enqueue(msg)) {
             std::this_thread::yield();
         }
@@ -406,10 +419,10 @@ private:
     std::vector<std::unique_ptr<LockFreeQueue<MessagePtr>>> worker_queues_;
     std::vector<std::thread> dispatchers_;
 
-    // Exact-match slots
+    // Exact-match slots (keyed by TopicId for O(1) integer hash)
     std::shared_mutex slots_mutex_;
-    std::unordered_map<std::string, std::unique_ptr<ITopicSlot>> slots_;
-    std::unordered_map<std::string, const std::type_info*> topic_types_;
+    std::unordered_map<TopicId, std::unique_ptr<ITopicSlot>> slots_;
+    std::unordered_map<TopicId, const std::type_info*> topic_types_;
 
     // Wildcard subscriptions
     struct WildcardEntry {
@@ -421,11 +434,16 @@ private:
     std::shared_mutex wildcards_mutex_;
     std::vector<WildcardEntry> wildcard_entries_;
 
+    struct SubInfo {
+        TopicId tid;
+        bool is_wildcard;
+    };
     std::mutex sub_map_mutex_;
-    std::unordered_map<SubscriptionId, std::string> sub_to_topic_;
+    std::unordered_map<SubscriptionId, SubInfo> sub_to_topic_;
 
     std::atomic<SubscriptionId> next_id_{0};
     std::atomic<bool> running_{false};
+    TopicRegistry registry_;
 };
 
 } // namespace msgbus
