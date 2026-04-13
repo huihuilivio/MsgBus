@@ -1,9 +1,9 @@
 #include "msgbus/message_bus.h"
 
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <thread>
-#include <chrono>
 
 struct SensorData {
     int sensor_id;
@@ -16,47 +16,56 @@ struct LogEvent {
 };
 
 int main() {
-    msgbus::MessageBus bus;
+    // Multi-dispatcher: 1 router thread + 4 worker threads (topic hash sharding).
+    // Use 0 for auto (= hardware_concurrency).
+    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 4);
     bus.start();
 
-    // --- Subscribe to sensor data ---
+    // --- Exact topic subscriptions ---
     auto sub1 = bus.subscribe<SensorData>("sensor/temperature",
         [](const SensorData& data) {
-            std::cout << "[Subscriber 1] Sensor " << data.sensor_id
-                      << " temperature: " << data.value << "\n";
+            std::cout << "[Temp] Sensor " << data.sensor_id
+                      << " = " << data.value << "°C\n";
         });
 
-    auto sub2 = bus.subscribe<SensorData>("sensor/temperature",
+    auto sub2 = bus.subscribe<SensorData>("sensor/humidity",
         [](const SensorData& data) {
-            if (data.value > 50.0) {
-                std::cout << "[Subscriber 2] WARNING: High temperature "
-                          << data.value << " from sensor " << data.sensor_id
-                          << "\n";
-            }
+            std::cout << "[Humidity] Sensor " << data.sensor_id
+                      << " = " << data.value << "%\n";
         });
 
-    // --- Subscribe to log events ---
-    auto sub3 = bus.subscribe<LogEvent>("system/log",
+    // --- Wildcard subscription: '*' matches one level ---
+    // Receives ALL sensor types (temperature, humidity, pressure, ...)
+    auto sub_all_sensors = bus.subscribe<SensorData>("sensor/*",
+        [](const SensorData& data) {
+            std::cout << "[AllSensors] Sensor " << data.sensor_id
+                      << " value: " << data.value << "\n";
+        });
+
+    // --- Wildcard subscription: '#' matches zero or more trailing levels ---
+    // Receives ALL log events under system/ (system/log, system/log/audit, ...)
+    auto sub_system = bus.subscribe<LogEvent>("system/#",
         [](const LogEvent& event) {
-            std::cout << "[Logger] [" << event.level << "] "
+            std::cout << "[System] [" << event.level << "] "
                       << event.message << "\n";
         });
 
-    // --- Publish some messages ---
+    // --- Publish messages to various topics ---
     bus.publish<SensorData>("sensor/temperature", {1, 23.5});
-    bus.publish<SensorData>("sensor/temperature", {2, 67.8});
-    bus.publish<LogEvent>("system/log", {"INFO", "System started"});
-    bus.publish<SensorData>("sensor/temperature", {1, 42.1});
-    bus.publish<LogEvent>("system/log", {"ERROR", "Disk full"});
+    bus.publish<SensorData>("sensor/humidity",    {2, 65.3});
+    bus.publish<SensorData>("sensor/temperature", {3, 67.8});
+    bus.publish<SensorData>("sensor/pressure",    {4, 1013.25});
+    bus.publish<LogEvent>("system/log",           {"INFO", "System started"});
+    bus.publish<LogEvent>("system/log/audit",     {"WARN", "Config changed"});
+    bus.publish<LogEvent>("system/log",           {"ERROR", "Disk full"});
 
-    // Wait for dispatcher to process
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // --- Unsubscribe sub1 ---
-    std::cout << "\n--- Unsubscribing subscriber 1 ---\n\n";
-    bus.unsubscribe(sub1);
+    // --- Unsubscribe the wildcard sensor listener ---
+    std::cout << "\n--- Unsubscribing wildcard sensor listener ---\n\n";
+    bus.unsubscribe(sub_all_sensors);
 
-    bus.publish<SensorData>("sensor/temperature", {3, 55.0});
+    bus.publish<SensorData>("sensor/temperature", {5, 55.0});
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     bus.stop();

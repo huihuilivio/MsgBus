@@ -3,3 +3,6 @@ target_link_libraries(basic_example PRIVATE msgbus)
 
 add_executable(coroutine_example coroutine_example.cpp)
 target_link_libraries(coroutine_example PRIVATE msgbus)
+
+add_executable(wildcard_example wildcard_example.cpp)
+target_link_libraries(wildcard_example PRIVATE msgbus)
