@@ -2,7 +2,9 @@
 
 ## CI 自动化压测
 
-每次推送到 `main` 分支或提交 PR 时，CI 会自动在以下环境运行性能压测：
+性能压测仅在 **tag 发布/预发布** 时运行（推送 `v*` tag 触发），普通提交和 PR 不执行压测以节省 CI 资源。
+
+发布时会在以下环境自动运行压测：
 
 | 平台 | 编译器 | Runner |
 |------|--------|--------|
@@ -11,7 +13,7 @@
 | Linux | Clang 17 | `ubuntu-latest` |
 | macOS | Apple Clang | `macos-latest` |
 
-压测结果以 artifact 形式保存，可在 [GitHub Actions](../../actions) 页面下载查看。
+压测结果会作为 artifact 附在 [GitHub Release](../../releases) 页面（`benchmark-*.txt`）。
 
 > **注意**：CI 环境为共享虚拟机，性能数据存在波动，仅用于回归检测和量级参考，不代表裸金属性能。
 
@@ -168,7 +170,7 @@ cmake --build build --config Release
 | Fan-out ×100 | ~84M del/s | 高扇出投递 |
 | 延迟 min | ~36 μs | dispatcher 空闲时 |
 
-> 以上为本地 Windows 环境参考数据。CI 各平台数据请在 [Actions artifacts](../../actions) 查看。
+> 以上为本地 Windows 环境参考数据。发布版本的各平台数据请在 [Releases](../../releases) 页面查看。
 
 ---
 

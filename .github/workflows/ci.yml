@@ -24,17 +24,6 @@ jobs:
       - name: Test
         run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure --timeout 30
 
-      - name: Benchmark
-        if: matrix.build_type == 'Release'
-        run: ./build/tests/Release/msgbus_bench.exe | Tee-Object -FilePath benchmark-windows.txt
-
-      - name: Upload benchmark results
-        if: matrix.build_type == 'Release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-windows
-          path: benchmark-windows.txt
-
   build-linux:
     runs-on: ubuntu-latest
     strategy:
@@ -69,18 +58,6 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 30
 
-      - name: Benchmark
-        if: matrix.build_type == 'Release'
-        run: |
-          ./build/tests/msgbus_bench | tee benchmark-${{ matrix.compiler }}.txt
-
-      - name: Upload benchmark results
-        if: matrix.build_type == 'Release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-linux-${{ matrix.compiler }}
-          path: benchmark-${{ matrix.compiler }}.txt
-
   build-macos:
     runs-on: macos-latest
     strategy:
@@ -97,15 +74,3 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 30
-
-      - name: Benchmark
-        if: matrix.build_type == 'Release'
-        run: |
-          ./build/tests/msgbus_bench | tee benchmark-macos.txt
-
-      - name: Upload benchmark results
-        if: matrix.build_type == 'Release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-macos
-          path: benchmark-macos.txt
