@@ -25,11 +25,18 @@
 
 namespace msgbus {
 
+// ---------- Tuning constants ----------
+inline constexpr size_t kDefaultQueueCapacity  = 65536;
+inline constexpr size_t kDefaultPoolCapacity    = 8192;
+inline constexpr unsigned kSpinThreshold        = 64;
+inline constexpr unsigned kYieldThreshold       = 256;
+inline constexpr unsigned kSleepMicroseconds    = 50;
+
 /// Per-type static object pool and recycler.
 template <typename T>
 struct TypedMessagePool {
     static ObjectPool<TypedMessage<T>>& instance() {
-        static ObjectPool<TypedMessage<T>> pool(8192);
+        static ObjectPool<TypedMessage<T>> pool(kDefaultPoolCapacity);
         return pool;
     }
 
@@ -42,8 +49,9 @@ class MessageBus {
 public:
     /// @param queue_capacity  Capacity of the internal lock-free queue.
     /// @param num_dispatchers Number of dispatcher threads (0 = auto = hardware_concurrency).
-    explicit MessageBus(size_t queue_capacity = 65536, unsigned num_dispatchers = 1)
+    explicit MessageBus(size_t queue_capacity = kDefaultQueueCapacity, unsigned num_dispatchers = 1)
         : queue_(queue_capacity)
+        , queue_capacity_(queue_capacity)
         , num_dispatchers_(num_dispatchers == 0
               ? std::max(1u, std::thread::hardware_concurrency())
               : num_dispatchers) {}
@@ -58,26 +66,43 @@ public:
         if (num_dispatchers_ == 1) {
             dispatchers_.emplace_back(&MessageBus::dispatchLoop, this);
         } else {
-            // Multi-dispatcher: one global dequeue thread fans out to per-worker queues
+            // Multi-dispatcher: router thread + N worker threads.
+            // Router is started FIRST so it can begin routing immediately.
+            // Workers are joined AFTER router to ensure all routed messages are consumed.
             worker_queues_.reserve(num_dispatchers_);
             for (unsigned i = 0; i < num_dispatchers_; ++i) {
                 worker_queues_.push_back(
-                    std::make_unique<LockFreeQueue<MessagePtr>>(queue_capacity()));
+                    std::make_unique<LockFreeQueue<MessagePtr>>(queue_capacity_));
             }
+            // Start router first (will be last in dispatchers_ vector)
+            dispatchers_.emplace_back(&MessageBus::routerLoop, this);
+            // Then start workers
             for (unsigned i = 0; i < num_dispatchers_; ++i) {
                 dispatchers_.emplace_back(&MessageBus::workerLoop, this, i);
             }
-            dispatchers_.emplace_back(&MessageBus::routerLoop, this);
         }
     }
 
     void stop() {
         if (!running_.exchange(false)) return;
-        for (auto& t : dispatchers_) {
-            if (t.joinable()) t.join();
+        if (dispatchers_.size() > 1) {
+            // Multi-dispatcher: join router first (dispatchers_[0]) so it
+            // finishes draining the main queue into worker queues, THEN
+            // join workers so they consume all routed messages.
+            if (dispatchers_[0].joinable()) dispatchers_[0].join();
+            // Signal workers that router is done draining
+            router_drained_.store(true, std::memory_order_release);
+            for (size_t i = 1; i < dispatchers_.size(); ++i) {
+                if (dispatchers_[i].joinable()) dispatchers_[i].join();
+            }
+        } else {
+            for (auto& t : dispatchers_) {
+                if (t.joinable()) t.join();
+            }
         }
         dispatchers_.clear();
         worker_queues_.clear();
+        router_drained_.store(false, std::memory_order_relaxed);
     }
 
     /// Publish a message to a topic. Returns false if queue is full.
@@ -168,6 +193,14 @@ public:
             auto s = state_;
             s->sub_id = s->bus.template subscribe<T>(s->topic,
                 [s, handle](const T& msg) {
+                    // Guard: ensure handler fires at most once.
+                    // In multi-dispatcher + wildcard scenarios, different topics
+                    // matching the same pattern may trigger this handler from
+                    // different worker threads concurrently.
+                    bool expected = false;
+                    if (!s->fired.compare_exchange_strong(expected, true)) {
+                        return; // Already fired — skip.
+                    }
                     s->result = msg;
                     handle.resume();
                 });
@@ -184,6 +217,7 @@ public:
             std::string topic;
             SubscriptionId sub_id{0};
             std::optional<T> result;
+            std::atomic<bool> fired{false};
             SharedState(MessageBus& b, std::string t)
                 : bus(b), topic(std::move(t)) {}
         };
@@ -199,18 +233,15 @@ public:
     unsigned dispatcher_count() const { return num_dispatchers_; }
 
 private:
-    size_t queue_capacity() const {
-        // Estimate: use same capacity as main queue for worker queues
-        return 65536;
-    }
-
     template <typename T>
     TopicSlot<T>* getOrCreateSlot(const std::string& topic) {
         {
             std::shared_lock<std::shared_mutex> lock(slots_mutex_);
             auto it = slots_.find(topic);
             if (it != slots_.end()) {
-                if (*topic_types_[topic] != typeid(T)) {
+                auto type_it = topic_types_.find(topic);
+                if (type_it != topic_types_.end() &&
+                    *type_it->second != typeid(T)) {
                     throw std::runtime_error(
                         "Type mismatch for topic: " + topic);
                 }
@@ -221,7 +252,9 @@ private:
         std::unique_lock<std::shared_mutex> lock(slots_mutex_);
         auto it = slots_.find(topic);
         if (it != slots_.end()) {
-            if (*topic_types_[topic] != typeid(T)) {
+            auto type_it = topic_types_.find(topic);
+            if (type_it != topic_types_.end() &&
+                *type_it->second != typeid(T)) {
                 throw std::runtime_error("Type mismatch for topic: " + topic);
             }
             return static_cast<TopicSlot<T>*>(it->second.get());
@@ -269,16 +302,18 @@ private:
                 idle = 0;
                 dispatchMessage(msg);
             } else {
-                if (idle < 64) {
+                if (idle < kSpinThreshold) {
                     ++idle;
-                } else if (idle < 256) {
+                } else if (idle < kYieldThreshold) {
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(kSleepMicroseconds));
                 }
             }
         }
+        // Drain remaining messages
         MessagePtr msg;
         while (queue_.try_dequeue(msg)) {
             dispatchMessage(msg);
@@ -296,31 +331,32 @@ private:
             MessagePtr msg;
             if (queue_.try_dequeue(msg)) {
                 idle = 0;
-                size_t idx = hasher(msg->topic()) % num_dispatchers_;
-                while (!worker_queues_[idx]->try_enqueue(msg)) {
-                    std::this_thread::yield();
-                }
+                routeToWorker(hasher, msg);
             } else {
-                if (idle < 64) {
+                if (idle < kSpinThreshold) {
                     ++idle;
-                } else if (idle < 256) {
+                } else if (idle < kYieldThreshold) {
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(kSleepMicroseconds));
                 }
             }
         }
-        // Drain main queue
+        // Drain main queue into worker queues.
+        // Workers are still alive (stop() joins router before workers).
         MessagePtr msg;
         while (queue_.try_dequeue(msg)) {
-            size_t idx = hasher(msg->topic()) % num_dispatchers_;
-            while (!worker_queues_[idx]->try_enqueue(msg)) {
-                std::this_thread::yield();
-            }
+            routeToWorker(hasher, msg);
         }
-        // Signal workers to drain by setting a flag they can check
-        // Workers will exit when running_ is false and their queue is empty
+    }
+
+    void routeToWorker(std::hash<std::string>& hasher, const MessagePtr& msg) {
+        size_t idx = hasher(msg->topic()) % num_dispatchers_;
+        while (!worker_queues_[idx]->try_enqueue(msg)) {
+            std::this_thread::yield();
+        }
     }
 
     /// Worker thread: dequeue from its own queue and dispatch.
@@ -333,17 +369,28 @@ private:
                 idle = 0;
                 dispatchMessage(msg);
             } else {
-                if (idle < 64) {
+                if (idle < kSpinThreshold) {
                     ++idle;
-                } else if (idle < 256) {
+                } else if (idle < kYieldThreshold) {
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(kSleepMicroseconds));
                 }
             }
         }
-        // Drain worker queue
+        // Keep draining until router has finished AND queue is empty.
+        // router_drained_ ensures we don't exit before router pushes last messages.
+        while (!router_drained_.load(std::memory_order_acquire)) {
+            MessagePtr msg;
+            if (wq.try_dequeue(msg)) {
+                dispatchMessage(msg);
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        // Final drain after router is done
         MessagePtr msg;
         while (wq.try_dequeue(msg)) {
             dispatchMessage(msg);
@@ -351,7 +398,9 @@ private:
     }
 
     LockFreeQueue<MessagePtr> queue_;
+    size_t queue_capacity_;
     unsigned num_dispatchers_;
+    std::atomic<bool> router_drained_{false};
 
     // Multi-dispatcher worker queues (one per worker)
     std::vector<std::unique_ptr<LockFreeQueue<MessagePtr>>> worker_queues_;

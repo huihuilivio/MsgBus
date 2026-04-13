@@ -94,7 +94,7 @@ MsgBus/
 │   └── coroutine_example.cpp          # C++20 协程示例
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # 单元测试（29 个 GTest 用例）
+│   ├── test_message_bus.cpp            # 单元测试（55 个 GTest 用例）
 │   └── bench_message_bus.cpp           # 性能压测（6 个基准场景）
 └── .github/
     └── workflows/
@@ -208,9 +208,16 @@ public:
 **文件**: `include/msgbus/message_bus.h`（内嵌）
 
 ```cpp
+// 可调参数（命名常量，非魔数）
+inline constexpr size_t kDefaultQueueCapacity  = 65536;
+inline constexpr size_t kDefaultPoolCapacity    = 8192;
+inline constexpr unsigned kSpinThreshold        = 64;
+inline constexpr unsigned kYieldThreshold       = 256;
+inline constexpr unsigned kSleepMicroseconds    = 50;
+
 template <typename T>
 struct TypedMessagePool {
-    static ObjectPool<TypedMessage<T>>& instance();   // 静态单例，容量 8192
+    static ObjectPool<TypedMessage<T>>& instance();   // 静态单例，容量 kDefaultPoolCapacity
     static void recycle(IMessage* msg);                // 回收回调
 };
 ```
@@ -303,9 +310,9 @@ dispatch 时:
 ```cpp
 class MessageBus {
 public:
-    /// @param queue_capacity  主队列容量（默认 65536）
+    /// @param queue_capacity  主队列容量（默认 kDefaultQueueCapacity = 65536）
     /// @param num_dispatchers dispatcher 线程数（默认 1，0 = 自动 = hardware_concurrency）
-    explicit MessageBus(size_t queue_capacity = 65536, unsigned num_dispatchers = 1);
+    explicit MessageBus(size_t queue_capacity = kDefaultQueueCapacity, unsigned num_dispatchers = 1);
 
     void start();   // 启动 dispatcher 线程
     void stop();    // 停止并排空队列
@@ -343,10 +350,10 @@ public:
 
 ```
 dispatchLoop():
-  空闲计数 < 64  → 自旋（最低延迟）
-  空闲计数 < 256 → yield（让出 CPU）
-  空闲计数 ≥ 256 → sleep 50μs（节省 CPU）
-  消息到达      → 立即重置计数，回到自旋
+  空闲计数 < kSpinThreshold(64)   → 自旋（最低延迟）
+  空闲计数 < kYieldThreshold(256) → yield（让出 CPU）
+  空闲计数 ≥ kYieldThreshold      → sleep kSleepMicroseconds(50)μs（节省 CPU）
+  消息到达                        → 立即重置计数，回到自旋
 ```
 
 **多线程 Dispatcher（num_dispatchers > 1）**：
@@ -365,7 +372,18 @@ Worker 线程 (workerLoop):
 
 **保序保证**：同一 topic 的消息通过 hash 分片始终路由到同一 worker，保证该 topic 内的投递顺序。
 
-**优雅关闭**：stop() 设置 `running_=false` → Router 排空主队列到各 worker 队列 → Worker 排空各自队列后退出。
+**优雅关闭**（安全时序）：
+
+```
+stop():
+  1. running_ = false
+  2. join Router 线程 → Router 排空主队列到各 worker 队列
+  3. router_drained_ = true（原子标志，release 语义）
+  4. join Worker 线程 → Worker 看到 router_drained_ 后做最终 drain
+```
+
+关键：**Router 先退出，Worker 后退出**，避免 Router drain 阶段推入的消息无人消费。
+Worker 在 `running_=false` 后进入等待循环，直到 `router_drained_=true` 才做最终排空退出。
 
 ---
 
@@ -384,11 +402,17 @@ class AsyncWaitAwaitable {
 ```
 co_await bus.async_wait<T>(topic)
   → await_suspend: subscribe, 保存 coroutine_handle
-  → 消息到来: dispatcher 调用 handler → 存结果 → resume handle
+  → 消息到来: dispatcher 调用 handler
+    → atomic CAS fired(false→true)，仅首次成功时:
+      → 存结果 → resume handle
+    → 后续触发直接跳过（防多 dispatcher + 通配符双发 race）
   → await_resume: unsubscribe, 返回结果
 ```
 
-**注意**：GCC 下需要 `template` 关键字处理依赖名: `s->bus.template subscribe<T>()`。
+**安全保证**：
+* `SharedState::fired`（`atomic<bool>`）CAS 保证 handler 最多触发一次
+* 防止多 dispatcher 模式下通配符匹配多 topic 导致 `handle.resume()` 被多线程同时调用
+* GCC 下需要 `template` 关键字处理依赖名: `s->bus.template subscribe<T>()`
 
 ---
 
@@ -410,7 +434,7 @@ co_await bus.async_wait<T>(topic)
 ### 5.2 内存管理
 
 * **消息生命周期**：`MessagePtr`（侵入式引用计数）从 publish 到最后一个 handler 完成后 → recycler 回收到对象池
-* **对象池回收**：`TypedMessagePool<T>` 静态单例，容量 8192，满则 delete
+* **对象池回收**：`TypedMessagePool<T>` 静态单例，容量 `kDefaultPoolCapacity`(8192)，满则 delete
 * **订阅者列表**：`shared_ptr<vector<Subscriber>>` COW，读者持有快照不受写者影响
 * **协程状态**：`shared_ptr<SharedState>` 确保 handler 回调和 awaitable 共享安全
 
@@ -504,11 +528,16 @@ co_await bus.async_wait<T>(topic)
 
 ### 可靠性
 - [x] 异常隔离（handler 崩溃保护）
+- [x] async_wait 协程防双发（atomic fired guard）
+- [x] 多 dispatcher 安全关闭（router_drained_ 时序保证）
+- [x] getOrCreateSlot 读锁下安全查找（消除 UB）
+- [x] 命名常量替代魔数
 - [ ] 日志系统接入
 - [ ] metrics（队列长度、延迟）
 
 ### 工程化
-- [x] 单元测试（29 个 GTest 用例）
+- [x] 单元测试（55 个 GTest 用例）
+- [x] 代码覆盖率统计（OpenCppCoverage / lcov，96.1%）
 - [x] 性能压测（6 个基准场景）
 - [x] GitHub Actions CI（Windows/Linux/macOS，UT 门禁）
 - [x] Release 工作流（tag 预发布 + 压测 + 源码包）

@@ -291,9 +291,10 @@ int main() {
 3. **Handler 线程**：单 dispatcher 模式下所有 handler 在一个线程中执行；多 dispatcher 模式下 handler 在 worker 线程中执行（同 topic 同 worker）。handler 应尽量轻量，避免阻塞。
 4. **Handler 异常**：单个 handler 抛异常不会影响其他订阅者，异常被静默捕获。
 5. **消息顺序**：同一 topic 的消息按 publish 顺序投递（单 dispatcher 直接保证；多 dispatcher 通过 hash 分片到同一 worker 保证）。
-6. **协程安全**：`async_wait` 是一次性等待，收到一条消息后自动取消订阅。
+6. **协程安全**：`async_wait` 是一次性等待，收到一条消息后自动取消订阅。内置 `atomic<bool>` 防护多 dispatcher 下的双发 race。
 7. **生命周期**：确保 `MessageBus` 的生命周期长于所有订阅者和协程。
 8. **通配符规则**：`*` 匹配恰好一层，`#` 匹配零层或多层且必须为 pattern 最后一段。
+9. **通配符 handler 线程安全**：多 dispatcher 模式下，通配符匹配的不同 topic 可能在不同 worker 线程中并发调用同一 handler，用户需保证通配符 handler 的线程安全性。
 
 ## 构建选项
 
@@ -301,10 +302,22 @@ int main() {
 |------------|--------|------|
 | `MSGBUS_BUILD_EXAMPLES` | ON | 构建示例 |
 | `MSGBUS_BUILD_TESTS` | ON | 构建测试（自动拉取 Google Test） |
+| `MSGBUS_COVERAGE` | OFF | 代码覆盖率（仅 GCC/Clang，添加 `--coverage` 编译标志） |
 
 ```bash
 # 仅构建库，不构建示例和测试
 cmake -B build -S . -DMSGBUS_BUILD_EXAMPLES=OFF -DMSGBUS_BUILD_TESTS=OFF
+
+# 启用代码覆盖率（Linux/macOS）
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DMSGBUS_COVERAGE=ON
+cmake --build build
+ctest --test-dir build
+lcov --capture --directory build --output-file coverage.info
+lcov --remove coverage.info '/usr/*' '*/googletest/*' --output-file coverage.info
+lcov --list coverage.info
+
+# Windows 使用 OpenCppCoverage
+OpenCppCoverage --sources include -- build\tests\Debug\msgbus_tests.exe
 ```
 
 ## 许可证
