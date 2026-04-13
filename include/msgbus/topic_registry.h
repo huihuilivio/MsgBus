@@ -2,6 +2,7 @@
 
 #include "msgbus/message.h"
 
+#include <functional>
 #include <mutex>
 #include <shared_mutex>
 #include <string>

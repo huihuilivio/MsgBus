@@ -3,6 +3,7 @@
 #include "msgbus/subscriber.h"
 #include "msgbus/topic_slot.h"
 
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <string>
