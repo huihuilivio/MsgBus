@@ -1092,3 +1092,163 @@ TEST_F(MessageBusTest, PublishWithCharLiteral) {
     ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), 88);
 }
+
+// ---------- TopicSlot direct tests ----------
+
+TEST(TopicSlotTest, RemoveNonExistentSubscriber) {
+    TopicSlot<int> slot;
+    slot.addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    // Remove an ID that doesn't exist → should return false
+    EXPECT_FALSE(slot.removeSubscriber(999));
+    // Original subscriber still exists
+    EXPECT_TRUE(slot.removeSubscriber(1));
+}
+
+// ---------- Concurrent subscribe same topic (double-checked locking) ----------
+
+TEST_F(MessageBusTest, ConcurrentSubscribeSameTopic) {
+    // Force getOrCreateSlot's write-lock path to find an existing slot
+    // (another thread created it between read-unlock and write-lock)
+    constexpr int THREADS = 8;
+    std::atomic<int> count{0};
+    std::vector<std::thread> threads;
+    std::vector<SubscriptionId> ids(THREADS);
+
+    for (int t = 0; t < THREADS; ++t) {
+        threads.emplace_back([&, t] {
+            ids[t] = bus.subscribe<int>("concurrent/sub",
+                [&](const int&) { count.fetch_add(1); });
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    // All subscribers should receive a message
+    bus.publish<int>("concurrent/sub", 42);
+    for (int i = 0; i < 100 && count.load() < THREADS; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(count.load(), THREADS);
+}
+
+// ---------- Multi-dispatcher drain paths ----------
+
+TEST_F(MultiDispatcherTest, StopDrainsAllMessages) {
+    // Publish messages, then stop immediately → exercises router drain + worker drain
+    std::atomic<int> received{0};
+    bus.subscribe<int>("drain/test", [&](const int&) {
+        received.fetch_add(1);
+    });
+
+    constexpr int N = 200;
+    for (int i = 0; i < N; ++i) {
+        while (!bus.publish<int>("drain/test", i)) {
+            std::this_thread::yield();
+        }
+    }
+
+    // Stop triggers drain in router and workers
+    bus.stop();
+
+    EXPECT_EQ(received.load(), N);
+}
+
+TEST_F(MultiDispatcherTest, RestartAfterStop) {
+    bus.stop();
+    bus.start();
+
+    std::promise<int> promise;
+    auto future = promise.get_future();
+
+    bus.subscribe<int>("restart/test", [&](const int& v) {
+        promise.set_value(v);
+    });
+    bus.publish<int>("restart/test", 55);
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_EQ(future.get(), 55);
+}
+
+// ---------- LockFreeQueue high-contention ----------
+
+TEST(LockFreeQueueTest, HighContentionMPMC) {
+    // Tiny queue + many threads → force CAS retry branches
+    LockFreeQueue<int> q(8);
+    constexpr int PRODUCERS = 8;
+    constexpr int CONSUMERS = 8;
+    constexpr int PER_PRODUCER = 500;
+    constexpr int TOTAL = PRODUCERS * PER_PRODUCER;
+
+    std::atomic<long long> sum{0};
+    std::atomic<int> consumed{0};
+    std::vector<std::thread> threads;
+
+    for (int p = 0; p < PRODUCERS; ++p) {
+        threads.emplace_back([&, p] {
+            for (int i = 0; i < PER_PRODUCER; ++i) {
+                int val = p * PER_PRODUCER + i + 1;
+                while (!q.try_enqueue(val)) {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+    for (int c = 0; c < CONSUMERS; ++c) {
+        threads.emplace_back([&] {
+            while (consumed.load(std::memory_order_relaxed) < TOTAL) {
+                int val;
+                if (q.try_dequeue(val)) {
+                    sum.fetch_add(val, std::memory_order_relaxed);
+                    consumed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    long long expected = 0;
+    for (int i = 1; i <= TOTAL; ++i) expected += i;
+    EXPECT_EQ(consumed.load(), TOTAL);
+    EXPECT_EQ(sum.load(), expected);
+}
+
+// ---------- WildcardTrie nested removal ----------
+
+TEST(WildcardTrieTest, RemoveDeepNestedChild) {
+    // Pattern stored deep in trie, removal requires recursive search
+    WildcardTrie trie;
+    auto slot1 = std::make_shared<TopicSlot<int>>();
+    slot1->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert("a/b/c/*/e", {&typeid(int), slot1, 1});
+
+    auto slot2 = std::make_shared<TopicSlot<int>>();
+    slot2->addSubscriber(std::function<void(const int&)>([](const int&) {}), 2);
+    trie.insert("a/b/c/d/f", {&typeid(int), slot2, 2});
+
+    // Remove the first — must recurse into children
+    EXPECT_TRUE(trie.remove(1));
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("a/b/c/x/e", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 0u); // removed
+
+    matched.clear();
+    trie.match("a/b/c/d/f", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u); // still alive
+}
+
+TEST(WildcardTrieTest, RemoveFromChildPrunesCorrectly) {
+    WildcardTrie trie;
+    auto slot = std::make_shared<TopicSlot<int>>();
+    slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert("x/y/z", {&typeid(int), slot, 1});
+
+    // Only entry, remove it — entire branch should be pruned
+    EXPECT_TRUE(trie.remove(1));
+    EXPECT_TRUE(trie.empty());
+
+    // Remove non-existent from empty trie
+    EXPECT_FALSE(trie.remove(42));
+}
