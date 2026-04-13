@@ -1,20 +1,39 @@
 # MsgBus 性能基准测试报告
 
-## 测试环境
+## CI 自动化压测
 
-- **OS**: Windows 10 (19045)
-- **编译器**: MSVC 19.42 (Visual Studio 2022)
-- **构建配置**: Release (`/O2`)
-- **CPU**: 可通过 `std::thread::hardware_concurrency()` 查看
-- **C++ 标准**: C++20
+每次推送到 `main` 分支或提交 PR 时，CI 会自动在以下环境运行性能压测：
 
-## 运行压测
+| 平台 | 编译器 | Runner |
+|------|--------|--------|
+| Windows | MSVC (latest) | `windows-latest` |
+| Linux | GCC 13 | `ubuntu-latest` |
+| Linux | Clang 17 | `ubuntu-latest` |
+| macOS | Apple Clang | `macos-latest` |
+
+压测结果以 artifact 形式保存，可在 [GitHub Actions](../../actions) 页面下载查看。
+
+> **注意**：CI 环境为共享虚拟机，性能数据存在波动，仅用于回归检测和量级参考，不代表裸金属性能。
+
+## 本地运行压测
 
 ```bash
 cmake -B build -S . -DCMAKE_CXX_STANDARD=20
 cmake --build build --config Release
-./build/tests/Release/msgbus_bench
+./build/tests/Release/msgbus_bench      # Windows
+./build/tests/msgbus_bench              # Linux / macOS
 ```
+
+---
+
+## 本地参考数据（Windows）
+
+### 测试环境
+
+- **OS**: Windows 10 (19045)
+- **编译器**: MSVC 19.42 (Visual Studio 2022)
+- **构建配置**: Release (`/O2`)
+- **C++ 标准**: C++20
 
 ---
 
@@ -148,6 +167,8 @@ cmake --build build --config Release
 | Fan-out ×10 | ~31M del/s | 广播投递 |
 | Fan-out ×100 | ~84M del/s | 高扇出投递 |
 | 延迟 min | ~36 μs | dispatcher 空闲时 |
+
+> 以上为本地 Windows 环境参考数据。CI 各平台数据请在 [Actions artifacts](../../actions) 查看。
 
 ---
 
