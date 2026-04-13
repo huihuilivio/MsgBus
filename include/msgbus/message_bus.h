@@ -2,6 +2,7 @@
 
 #include "msgbus/lock_free_queue.h"
 #include "msgbus/message.h"
+#include "msgbus/object_pool.h"
 #include "msgbus/subscriber.h"
 #include "msgbus/topic_slot.h"
 
@@ -21,6 +22,19 @@
 #include <utility>
 
 namespace msgbus {
+
+/// Per-type static object pool and recycler.
+template <typename T>
+struct TypedMessagePool {
+    static ObjectPool<TypedMessage<T>>& instance() {
+        static ObjectPool<TypedMessage<T>> pool(8192);
+        return pool;
+    }
+
+    static void recycle(IMessage* msg) {
+        instance().release(static_cast<TypedMessage<T>*>(msg));
+    }
+};
 
 class MessageBus {
 public:
@@ -43,10 +57,18 @@ public:
     }
 
     /// Publish a message to a topic. Returns false if queue is full.
+    /// Uses per-type object pool to avoid heap allocation on the hot path.
     template <typename T>
     bool publish(const std::string& topic, T msg) {
-        auto message = std::make_shared<TypedMessage<T>>(topic, std::move(msg));
-        return queue_.try_enqueue(std::move(message));
+        auto& pool = TypedMessagePool<T>::instance();
+        TypedMessage<T>* raw = pool.acquire();
+        if (raw) {
+            raw->reset(topic, std::move(msg));
+        } else {
+            raw = new TypedMessage<T>(topic, std::move(msg));
+        }
+        raw->recycler_ = &TypedMessagePool<T>::recycle;
+        return queue_.try_enqueue(MessagePtr::adopt(raw));
     }
 
     /// Subscribe to a topic with a handler. Returns a subscription ID.
