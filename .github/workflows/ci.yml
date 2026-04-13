@@ -96,8 +96,8 @@ jobs:
 
       - name: Collect coverage
         run: |
-          lcov --capture --directory build --output-file coverage.info --rc branch_coverage=1 --gcov-tool gcov-13 --ignore-errors negative
-          lcov --remove coverage.info '/usr/*' '*/googletest/*' '*/gtest/*' --output-file coverage.info --rc branch_coverage=1 --ignore-errors negative
+          lcov --capture --directory build --output-file coverage.info --rc branch_coverage=1 --gcov-tool gcov-13 --ignore-errors negative,mismatch
+          lcov --remove coverage.info '/usr/*' '*/googletest/*' '*/gtest/*' --output-file coverage.info --rc branch_coverage=1 --ignore-errors negative,mismatch
           lcov --list coverage.info --rc branch_coverage=1
 
       - name: Upload coverage artifact
