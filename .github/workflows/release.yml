@@ -1,0 +1,34 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Create source archive
+        run: |
+          PREFIX="MsgBus-${{ steps.version.outputs.VERSION }}"
+          git archive --format=tar.gz --prefix="${PREFIX}/" HEAD -o "${PREFIX}.tar.gz"
+          git archive --format=zip --prefix="${PREFIX}/" HEAD -o "${PREFIX}.zip"
+
+      - name: Create pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            MsgBus-${{ steps.version.outputs.VERSION }}.tar.gz
+            MsgBus-${{ steps.version.outputs.VERSION }}.zip
