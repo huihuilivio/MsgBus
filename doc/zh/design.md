@@ -96,6 +96,7 @@ MsgBus/
 │       ├── topic_matcher.h            # MQTT 风格 topic 通配符匹配
 │       ├── topic_registry.h           # TopicId ↔ 字符串 线程安全注册表
 │       ├── topic_slot.h               # TopicSlot<T> COW 订阅管理
+│       ├── wildcard_trie.h            # 通配符 Trie 索引（O(depth) 匹配）
 │       └── message_bus.h              # MessageBus 核心 + 对象池 + 多dispatcher + 通配符 + 协程 + TopicRegistry
 ├── examples/
 │   ├── CMakeLists.txt
@@ -314,7 +315,46 @@ bool isWildcard(std::string_view pattern);
 
 ---
 
-### 4.7 TopicSlot — COW 订阅管理
+### 4.7 WildcardTrie — 通配符 Trie 索引
+
+**文件**: `include/msgbus/wildcard_trie.h`
+
+将通配符订阅 pattern 按 topic 层级建立 Trie 树，dispatch 时沿 concrete topic 的层级遍历 Trie，复杂度为 **O(topic 层级深度)** 而非 O(N)。
+
+```cpp
+class WildcardTrie {
+public:
+    void insert(const Entry& entry);       // 插入通配符 pattern
+    bool remove(SubscriptionId id);        // 按 ID 移除
+    void match(std::string_view topic,     // 查找匹配的 slot
+               const std::type_info& type,
+               std::vector<ITopicSlot*>& out) const;
+    bool empty() const;
+};
+```
+
+**匹配算法**：
+
+```
+matchNode(node, levels, depth):
+  1. 检查 node 的 '#' 子节点 → 匹配所有剩余层级（终端）
+  2. depth == levels.size() → 检查当前节点的 entries
+  3. 检查精确匹配子节点 levels[depth] → 递归 depth+1
+  4. 检查 '*' 子节点 → 递归 depth+1（跳过一层）
+```
+
+**关键设计**：
+
+| 特性 | 实现 |
+|------|------|
+| 复杂度 | O(topic depth)，与 pattern 数量无关 |
+| 扩展性 | 100 个 pattern vs 1000 个 pattern QPS 相同（~1.6M） |
+| 线程安全 | 外部 shared_mutex 保护（读写分离） |
+| 内存 | `unordered_map<string, unique_ptr<Node>>` 树结构 |
+
+---
+
+### 4.8 TopicSlot — COW 订阅管理
 
 **文件**: `include/msgbus/topic_slot.h`
 
@@ -349,7 +389,7 @@ dispatch 时:
 
 ---
 
-### 4.8 MessageBus — 核心总线
+### 4.9 MessageBus — 核心总线
 
 **文件**: `include/msgbus/message_bus.h`
 
@@ -388,8 +428,8 @@ public:
 
 ```
 1. 精确匹配: slots_[topic_id] → TopicSlot<T>::dispatch()（整数哈希查找）
-2. 通配符匹配: registry_.to_string(topic_id) → 遍历 wildcard_entries_
-   → topicMatches(pattern, topic_sv) → WildcardEntry::slot->dispatch()
+2. 通配符匹配: registry_.to_string(topic_id) → WildcardTrie::match()
+   → O(topic depth) 遍历 Trie，返回匹配的 slot 列表
 ```
 
 **单线程 Dispatcher（num_dispatchers == 1）**：
@@ -398,7 +438,7 @@ public:
 dispatchLoop():
   空闲计数 < kSpinThreshold(64)   → 自旋（最低延迟）
   空闲计数 < kYieldThreshold(256) → yield（让出 CPU）
-  空闲计数 ≥ kYieldThreshold      → sleep kSleepMicroseconds(50)μs（节省 CPU）
+  空闲计数 ≥ kYieldThreshold      → condition_variable wait（被 publish notify 唤醒）
   消息到达                        → 立即重置计数，回到自旋
 ```
 
@@ -433,7 +473,7 @@ Worker 在 `running_=false` 后进入等待循环，直到 `router_drained_=true
 
 ---
 
-### 4.9 AsyncWaitAwaitable — 协程支持
+### 4.10 AsyncWaitAwaitable — 协程支持
 
 ```cpp
 template <typename T>
@@ -473,7 +513,7 @@ co_await bus.async_wait<T>(topic)
 | `subscribe` (通配符) | shared_mutex 写锁 | 追加 WildcardEntry |
 | `unsubscribe` | mutex / shared_mutex | 同上 |
 | `dispatch` (精确) | **读无锁** | TopicId 整数哈希查找，仅 shared_ptr 拷贝加锁，遍历无锁 |
-| `dispatch` (通配符) | shared_mutex 读锁 | 遍历 wildcard_entries_ 匹配 |
+| `dispatch` (通配符) | shared_mutex 读锁 | Trie 遍历 O(depth)，不随模式数增长 |
 | Topic 查找 | shared_mutex 读锁 | TopicId 整数键哈希表查找，读多写少 |
 | TopicRegistry resolve | shared_lock / unique_lock | 已注册只需 shared_lock，首次注册 unique_lock |
 | Router 路由 | **完全无锁** | hash(TopicId) + CAS 入 worker 队列 |
@@ -516,6 +556,8 @@ co_await bus.async_wait<T>(topic)
 * 对象池 + `reset()`：消息对象复用，避免构造/析构开销
 * recycler 函数指针：零虚函数开销的回收路径
 * TopicId 整数路由：dispatch/route 路径上用 `uint32_t` 替代 `std::string` 哈希/比较
+* 通配符 Trie 索引：O(topic depth) 匹配替代 O(N) 线性扫描
+* 条件变量退避：替代 sleep，空闲时被 publish notify 快速唤醒
 
 ---
 
@@ -526,7 +568,9 @@ co_await bus.async_wait<T>(topic)
 | ~~多线程 dispatcher~~ | ~~P2~~ | ✅ 已实现 | 按 topic hash 分片到线程池 |
 | ~~Zero-copy 优化~~ | ~~P3~~ | ✅ 已实现 | 对象池 + 侵入式引用计数 |
 | ~~Topic 通配符~~ | ~~P3~~ | ✅ 已实现 | MQTT 风格 `*` / `#` |
-| ~~TopicId 整数路由~~ | ~~P2~~ | ✅ 已实现 | TopicRegistry + uint32_t 替代 string，多 Topic +26% |
+| ~~TopicId 整数路由~~ | ~~P2~~ | ✅ 已实现 | TopicRegistry + uint32_t 替代 string，多 Topic +86% |
+| ~~通配符 Trie 索引~~ | ~~P2~~ | ✅ 已实现 | O(depth) 匹配，不随 pattern 数增长 |
+| ~~条件变量退避~~ | ~~P2~~ | ✅ 已实现 | 替代 sleep，p50 延迟 ~7x |
 | Backpressure | P2 | 待实现 | publish 返回 false 时限流策略 |
 | Batch 消费 | P2 | 待实现 | 一次 dequeue 多条，减少调度开销 |
 | 优先级队列 | P3 | 待实现 | 消息优先级 |
@@ -558,6 +602,18 @@ co_await bus.async_wait<T>(topic)
 - [x] slots_ / topic_types_ 以 TopicId 为键（整数哈希）
 - [x] routeToWorker 使用 hash(TopicId) 路由
 - [x] 通配符 unsubscribe 无需反查字符串（SubInfo 标志区分）
+
+### 通配符 Trie 索引
+- [x] 实现 WildcardTrie（按 topic 层级建立 Trie 树）
+- [x] 匹配复杂度 O(depth)，与模式数量无关
+- [x] 替代 wildcard_entries_ 线性扫描
+- [x] WildcardTrie 单元测试（7 个用例）
+
+### 条件变量退避
+- [x] dispatch/router/worker 线程用 condition_variable 替代 sleep
+- [x] publish 时 notify_one 唤醒 dispatcher
+- [x] routeToWorker 时 notify_one 唤醒对应 worker
+- [x] stop() 时 notify_all 唤醒所有线程
 
 ### 多 Dispatcher
 - [x] 实现 Router 线程（hash 分片路由）
@@ -592,9 +648,9 @@ co_await bus.async_wait<T>(topic)
 - [ ] metrics（队列长度、延迟）
 
 ### 工程化
-- [x] 单元测试（59 个 GTest 用例）
+- [x] 单元测试（66 个 GTest 用例）
 - [x] 代码覆盖率统计（OpenCppCoverage / lcov，96.1%）
-- [x] 性能压测（6 个基准场景）
+- [x] 性能压测（8 个基准场景）
 - [x] GitHub Actions CI（Windows/Linux/macOS，UT 门禁）
 - [x] Release 工作流（tag 预发布 + 压测 + 源码包）
 - [x] 文档完善（设计文档 + 使用文档 + 性能文档）

@@ -2,6 +2,7 @@
 #include "msgbus/object_pool.h"
 #include "msgbus/topic_matcher.h"
 #include "msgbus/topic_registry.h"
+#include "msgbus/wildcard_trie.h"
 
 #include <gtest/gtest.h>
 
@@ -859,4 +860,127 @@ TEST_F(MultiDispatcherTest, SameTopicOrdering) {
 TEST_F(MultiDispatcherTest, AutoDispatcherCount) {
     MessageBus auto_bus(65536, 0); // 0 = auto
     EXPECT_GE(auto_bus.dispatcher_count(), 1u);
+}
+
+// ---------- WildcardTrie Tests ----------
+
+TEST(WildcardTrieTest, SingleLevelMatch) {
+    WildcardTrie trie;
+    auto slot = std::make_shared<TopicSlot<int>>();
+    slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert({"sensor/*/temp", &typeid(int), slot, 1});
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("sensor/1/temp", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+
+    matched.clear();
+    trie.match("sensor/1/humidity", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 0u);
+
+    matched.clear();
+    trie.match("sensor/1/2/temp", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 0u);
+}
+
+TEST(WildcardTrieTest, MultiLevelMatch) {
+    WildcardTrie trie;
+    auto slot = std::make_shared<TopicSlot<int>>();
+    slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert({"sensor/#", &typeid(int), slot, 1});
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("sensor/temp", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+
+    matched.clear();
+    trie.match("sensor/a/b/c", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+
+    matched.clear();
+    trie.match("sensor", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+
+    matched.clear();
+    trie.match("other/thing", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 0u);
+}
+
+TEST(WildcardTrieTest, MixedWildcards) {
+    WildcardTrie trie;
+    auto slot = std::make_shared<TopicSlot<int>>();
+    slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert({"a/*/c/#", &typeid(int), slot, 1});
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("a/b/c/d/e", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+
+    matched.clear();
+    trie.match("a/x/c", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+
+    matched.clear();
+    trie.match("a/b/d", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 0u);
+}
+
+TEST(WildcardTrieTest, MultiplePatterns) {
+    WildcardTrie trie;
+    auto slot1 = std::make_shared<TopicSlot<int>>();
+    slot1->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert({"sensor/#", &typeid(int), slot1, 1});
+
+    auto slot2 = std::make_shared<TopicSlot<int>>();
+    slot2->addSubscriber(std::function<void(const int&)>([](const int&) {}), 2);
+    trie.insert({"sensor/*/temp", &typeid(int), slot2, 2});
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("sensor/1/temp", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 2u); // both patterns match
+}
+
+TEST(WildcardTrieTest, RemoveEntry) {
+    WildcardTrie trie;
+    auto slot = std::make_shared<TopicSlot<int>>();
+    slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert({"sensor/#", &typeid(int), slot, 1});
+
+    EXPECT_FALSE(trie.empty());
+    EXPECT_TRUE(trie.remove(1));
+    EXPECT_TRUE(trie.empty());
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("sensor/temp", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 0u);
+}
+
+TEST(WildcardTrieTest, TypeFiltering) {
+    WildcardTrie trie;
+    auto slot = std::make_shared<TopicSlot<int>>();
+    slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert({"data/#", &typeid(int), slot, 1});
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("data/x", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+
+    matched.clear();
+    trie.match("data/x", typeid(std::string), matched);
+    EXPECT_EQ(matched.size(), 0u); // type mismatch
+}
+
+TEST(WildcardTrieTest, HashMatchesRoot) {
+    WildcardTrie trie;
+    auto slot = std::make_shared<TopicSlot<int>>();
+    slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), 1);
+    trie.insert({"#", &typeid(int), slot, 1});
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("anything/at/all", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+
+    matched.clear();
+    trie.match("x", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
 }

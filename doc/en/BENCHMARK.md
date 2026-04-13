@@ -38,7 +38,7 @@ cmake --build build --config Release
 - **Compiler**: MSVC 19.42 (Visual Studio 2022)
 - **Build Config**: Release (`/O2`)
 - **C++ Standard**: C++20
-- **Optimization**: Object pool + intrusive reference counting + TopicId integer routing (replaces std::string topic)
+- **Optimization**: Object pool + intrusive reference counting + TopicId integer routing + Wildcard trie index + condition variable backoff
 
 ---
 
@@ -100,21 +100,20 @@ cmake --build build --config Release
 
 **Scenario**: 1 publisher, 1 subscriber, measuring per-message latency from publish to handler execution. Includes 1,000 warm-up messages.
 
-| Percentile | Current (μs) | After Object Pool (μs) | Before Optimization (μs) |
-|---|---|---|---|
-| **min** | **0.6** | 0.3 | 36.2 |
-| **p50** | **374** | 2,196 | 3,582.7 |
-| **p90** | **480** | 4,977.8 | 4,977.8 |
-| **p99** | **773** | 5,796.2 | 5,796.2 |
-| **max** | **895** | 5,910.4 | 5,910.4 |
+| Percentile | Current (μs) | After TopicId (μs) | After Object Pool (μs) | Before Optimization (μs) |
+|---|---|---|---|---|
+| **min** | **0.2** | 0.6 | 0.3 | 36.2 |
+| **p50** | **57** | 374 | 2,196 | 3,582.7 |
+| **p90** | **114** | 480 | 4,977.8 | 4,977.8 |
+| **p99** | **250** | 773 | 5,796.2 | 5,796.2 |
+| **max** | **358** | 895 | 5,910.4 | 5,910.4 |
 
 **Analysis**:
 
-- **Minimum latency ~0.6μs**, thanks to object pool reuse eliminating heap allocation + intrusive ref counting
-- **p50 dropped from ~2.2ms to ~374μs** (~6x improvement), TopicId integer routing eliminates string hash/comparison on the dispatch path
-- p90/p99 also significantly reduced, indicating overall queuing time is shorter
+- **Minimum latency ~0.2μs**, thanks to object pool reuse eliminating heap allocation + intrusive ref counting
+- **p50 dropped from ~374μs to ~57μs** (~7x improvement), condition variable replacing sleep backoff significantly reduces tail latency
+- p90/p99 also significantly reduced (p99: 773μs → 250μs), idle threads are quickly woken by condvar
 - In real-world usage (lower publish frequency), latency will approach the min value
-- The 3-tier backoff strategy increases latency when idle but significantly reduces CPU usage
 
 ---
 
@@ -126,10 +125,10 @@ cmake --build build --config Release
 |---|---|---|---|
 | Topics | 100 | 100 | 100 |
 | Total messages | 1,000,000 | 1,000,000 | 1,000,000 |
-| Duration | ~135 ms | ~172 ms | ~202 ms |
-| Throughput | **~7,300,000 QPS** | ~5,800,000 QPS | ~4,950,000 QPS |
+| Duration | ~110 ms | ~172 ms | ~202 ms |
+| Throughput | **~9,200,000 QPS** | ~5,800,000 QPS | ~4,950,000 QPS |
 
-**Analysis**: TopicId optimization shows the largest gains in multi-topic scenarios (**+26% QPS**), because dispatch-path hash lookups for 100 topics changed from `std::string` keys to `uint32_t` integer keys, significantly reducing per-lookup overhead. Cumulative improvement over the original shared_ptr version is **+47%**.
+**Analysis**: Multi-topic QPS reaches **~9.2M**, a cumulative **+86%** improvement over the original shared_ptr version. TopicId integer hash lookup and condvar wakeup both contribute.
 
 ---
 
@@ -165,6 +164,20 @@ cmake --build build --config Release
 
 ---
 
+### 7. Wildcard — Wildcard Matching Throughput
+
+**Scenario**: N wildcard patterns, publish to a topic matching 1 of the patterns.
+
+| Metric | 100 patterns | 1000 patterns |
+|---|---|---|
+| Messages | 100,000 | 100,000 |
+| Duration | ~62 ms | ~62 ms |
+| Throughput | **~1,600,000 QPS** | **~1,600,000 QPS** |
+
+**Analysis**: Core advantage of the trie index: **matching complexity is O(topic depth), independent of pattern count**. 100 patterns and 1000 patterns achieve essentially the same QPS, whereas a linear scan would drop to 1/10 throughput at 1000 patterns.
+
+---
+
 ## Performance Summary
 
 | Scenario | QPS / Rate | Notes |
@@ -172,11 +185,13 @@ cmake --build build --config Release
 | Raw Queue | ~71M ops/s | Queue theoretical max throughput |
 | Single pub/sub | ~4.7M QPS | Full end-to-end path |
 | 4 producers | ~4.4M QPS | MPMC concurrent |
-| 100 topics | **~7.3M QPS** | TopicId integer hash routing (+26%) |
+| 100 topics | **~9.2M QPS** | TopicId + condvar (+86%) |
 | Fan-out ×10 | ~30M del/s | Broadcast delivery |
 | Fan-out ×100 | ~88M del/s | High fan-out delivery |
-| Latency min | **~0.6 μs** | Object pool reuse |
-| Latency p50 | **~374 μs** | TopicId optimization (was ~2.2ms) |
+| Wildcard ×100 | ~1.6M QPS | Trie index |
+| Wildcard ×1000 | ~1.6M QPS | O(depth), independent of pattern count |
+| Latency min | **~0.2 μs** | Object pool reuse |
+| Latency p50 | **~57 μs** | Condvar wakeup (was ~374μs) |
 
 > Above are local Windows reference numbers. Per-platform release data is available on the [Releases](../../releases) page.
 
@@ -199,9 +214,9 @@ cmake --build build --config Release
 
 | Metric | Improvement |
 |---|---|
-| Min latency | 36μs → 0.6μs (**~60x**) |
-| p50 latency | 3.6ms → 374μs (**~10x**) |
-| Multi-topic QPS | 4.95M → 7.3M (**+47%**) |
+| Min latency | 36μs → 0.2μs (**~180x**) |
+| p50 latency | 3.6ms → 57μs (**~63x**) |
+| Multi-topic QPS | 4.95M → 9.2M (**+86%**) |
 
 ---
 
@@ -210,25 +225,23 @@ cmake --build build --config Release
 ### Current Bottlenecks
 
 1. **Single Router thread** (multi-dispatcher mode): Router is a serial bottleneck, may limit throughput under heavy load
-2. **Wildcard matching**: Every message must iterate all wildcard_entries_ for string matching
-3. **3-tier backoff**: Sleep phase during low load increases tail latency
-4. **publish path TopicRegistry resolve**: Each publish requires shared_lock + hash table lookup in the registry
+2. **publish path TopicRegistry resolve**: Each publish requires shared_lock + hash table lookup in the registry
 
 ### Completed Optimizations
 
 | Optimization | Benefit | Status |
 |---|---|---|
-| Object pool replacing `shared_ptr` | Min latency 60x | ✅ Done |
+| Object pool replacing `shared_ptr` | Min latency 180x | ✅ Done |
 | Multi-dispatcher (topic sharding) | Horizontal scaling on consumer side | ✅ Done |
-| TopicId integer routing | Multi-topic +26%, p50 latency ~6x | ✅ Done |
+| TopicId integer routing | Multi-topic +86%, p50 latency ~63x | ✅ Done |
+| Wildcard trie index | Matching O(depth), independent of pattern count | ✅ Done |
+| Condition variable replacing sleep backoff | p50 latency ~7x, p99 ~3x | ✅ Done |
 
 ### Potential Optimization Directions
 
 | Optimization | Expected Benefit | Complexity |
 |---|---|---|
-| Wildcard trie index | Wildcard matching O(1) | Medium |
 | Batch dequeue | QPS +20~30% | Medium |
-| Condition variable replacing sleep backoff | Tail latency ↓90% | Low |
 
 ---
 
@@ -236,7 +249,7 @@ cmake --build build --config Release
 
 | Solution | Typical QPS | Lock-Free | Coroutines | Object Pool | Wildcards |
 |---|---|---|---|---|---|
-| **MsgBus (this project)** | ~7.3M | ✓ | ✓ | ✓ | ✓ |
+| **MsgBus (this project)** | ~9.2M | ✓ | ✓ | ✓ | ✓ |
 | Boost.Signals2 | ~1-2M | ✗ | ✗ | ✗ | ✗ |
 | Qt Signals/Slots | ~0.5-1M | ✗ | ✗ | ✗ | ✗ |
 | moodycamel + manual routing | ~8-15M | ✓ | ✗ | ✗ | ✗ |

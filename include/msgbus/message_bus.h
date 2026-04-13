@@ -7,9 +7,11 @@
 #include "msgbus/topic_matcher.h"
 #include "msgbus/topic_registry.h"
 #include "msgbus/topic_slot.h"
+#include "msgbus/wildcard_trie.h"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <coroutine>
 #include <functional>
 #include <memory>
@@ -31,7 +33,6 @@ inline constexpr size_t kDefaultQueueCapacity  = 65536;
 inline constexpr size_t kDefaultPoolCapacity    = 8192;
 inline constexpr unsigned kSpinThreshold        = 64;
 inline constexpr unsigned kYieldThreshold       = 256;
-inline constexpr unsigned kSleepMicroseconds    = 50;
 
 /// Per-type static object pool and recycler.
 template <typename T>
@@ -71,9 +72,13 @@ public:
             // Router is started FIRST so it can begin routing immediately.
             // Workers are joined AFTER router to ensure all routed messages are consumed.
             worker_queues_.reserve(num_dispatchers_);
+            worker_cvs_.reserve(num_dispatchers_);
+            worker_cv_mutexes_.reserve(num_dispatchers_);
             for (unsigned i = 0; i < num_dispatchers_; ++i) {
                 worker_queues_.push_back(
                     std::make_unique<LockFreeQueue<MessagePtr>>(queue_capacity_));
+                worker_cvs_.push_back(std::make_unique<std::condition_variable>());
+                worker_cv_mutexes_.push_back(std::make_unique<std::mutex>());
             }
             // Start router first (will be last in dispatchers_ vector)
             dispatchers_.emplace_back(&MessageBus::routerLoop, this);
@@ -86,6 +91,10 @@ public:
 
     void stop() {
         if (!running_.exchange(false)) return;
+        // Wake all sleeping threads
+        cv_.notify_all();
+        for (auto& wcv : worker_cvs_) wcv->notify_all();
+
         if (dispatchers_.size() > 1) {
             // Multi-dispatcher: join router first (dispatchers_[0]) so it
             // finishes draining the main queue into worker queues, THEN
@@ -103,6 +112,8 @@ public:
         }
         dispatchers_.clear();
         worker_queues_.clear();
+        worker_cvs_.clear();
+        worker_cv_mutexes_.clear();
         router_drained_.store(false, std::memory_order_relaxed);
     }
 
@@ -118,7 +129,9 @@ public:
             raw = new TypedMessage<T>(tid, std::move(msg));
         }
         raw->recycler_ = &TypedMessagePool<T>::recycle;
-        return queue_.try_enqueue(MessagePtr::adopt(raw));
+        bool ok = queue_.try_enqueue(MessagePtr::adopt(raw));
+        if (ok) cv_.notify_one();
+        return ok;
     }
 
     /// Subscribe to a topic (or wildcard pattern) with a handler.
@@ -129,13 +142,13 @@ public:
         auto id = next_id_.fetch_add(1, std::memory_order_relaxed) + 1;
 
         if (isWildcard(topic)) {
-            // Wildcard subscription: store pattern + slot (no TopicId needed)
+            // Wildcard subscription: insert into trie index
             auto slot = std::make_shared<TopicSlot<T>>();
             slot->addSubscriber(
                 std::function<void(const T&)>(std::forward<Handler>(handler)), id);
 
             std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
-            wildcard_entries_.push_back({topic, &typeid(T), slot, id});
+            wildcard_trie_.insert({topic, &typeid(T), slot, id});
 
             std::lock_guard<std::mutex> lk(sub_map_mutex_);
             sub_to_topic_[id] = {kInvalidTopicId, true};
@@ -164,13 +177,7 @@ public:
 
         if (info.is_wildcard) {
             std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
-            for (auto it = wildcard_entries_.begin(); it != wildcard_entries_.end(); ++it) {
-                if (it->sub_id == id) {
-                    it->slot->removeSubscriber(id);
-                    wildcard_entries_.erase(it);
-                    break;
-                }
-            }
+            wildcard_trie_.remove(id);
         } else {
             ITopicSlot* slot = nullptr;
             {
@@ -292,16 +299,16 @@ private:
             }
         }
 
-        // 2. Wildcard-match dispatch (resolve ID → string_view for matching)
+        // 2. Wildcard-match dispatch via trie (O(topic depth) instead of O(N))
         {
             std::shared_lock<std::shared_mutex> lock(wildcards_mutex_);
-            if (!wildcard_entries_.empty()) {
+            if (!wildcard_trie_.empty()) {
                 std::string_view topic_sv = registry_.to_string(tid);
-                for (auto& entry : wildcard_entries_) {
-                    if (*entry.type == msg->type() &&
-                        topicMatches(entry.pattern, topic_sv)) {
-                        entry.slot->dispatch(msg);
-                    }
+                thread_local std::vector<ITopicSlot*> matched;
+                matched.clear();
+                wildcard_trie_.match(topic_sv, msg->type(), matched);
+                for (auto* slot : matched) {
+                    slot->dispatch(msg);
                 }
             }
         }
@@ -322,8 +329,9 @@ private:
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(
-                        std::chrono::microseconds(kSleepMicroseconds));
+                    std::unique_lock<std::mutex> lk(cv_mutex_);
+                    cv_.wait_for(lk, std::chrono::milliseconds(1),
+                        [this] { return !running_.load(std::memory_order_relaxed); });
                 }
             }
         }
@@ -352,8 +360,9 @@ private:
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(
-                        std::chrono::microseconds(kSleepMicroseconds));
+                    std::unique_lock<std::mutex> lk(cv_mutex_);
+                    cv_.wait_for(lk, std::chrono::milliseconds(1),
+                        [this] { return !running_.load(std::memory_order_relaxed); });
                 }
             }
         }
@@ -370,11 +379,14 @@ private:
         while (!worker_queues_[idx]->try_enqueue(msg)) {
             std::this_thread::yield();
         }
+        worker_cvs_[idx]->notify_one();
     }
 
     /// Worker thread: dequeue from its own queue and dispatch.
     void workerLoop(unsigned worker_id) {
         auto& wq = *worker_queues_[worker_id];
+        auto& wcv = *worker_cvs_[worker_id];
+        auto& wcv_mu = *worker_cv_mutexes_[worker_id];
         unsigned idle = 0;
         while (running_.load(std::memory_order_relaxed)) {
             MessagePtr msg;
@@ -388,8 +400,9 @@ private:
                     ++idle;
                     std::this_thread::yield();
                 } else {
-                    std::this_thread::sleep_for(
-                        std::chrono::microseconds(kSleepMicroseconds));
+                    std::unique_lock<std::mutex> lk(wcv_mu);
+                    wcv.wait_for(lk, std::chrono::milliseconds(1),
+                        [this] { return !running_.load(std::memory_order_relaxed); });
                 }
             }
         }
@@ -417,6 +430,8 @@ private:
 
     // Multi-dispatcher worker queues (one per worker)
     std::vector<std::unique_ptr<LockFreeQueue<MessagePtr>>> worker_queues_;
+    std::vector<std::unique_ptr<std::condition_variable>> worker_cvs_;
+    std::vector<std::unique_ptr<std::mutex>> worker_cv_mutexes_;
     std::vector<std::thread> dispatchers_;
 
     // Exact-match slots (keyed by TopicId for O(1) integer hash)
@@ -424,15 +439,9 @@ private:
     std::unordered_map<TopicId, std::unique_ptr<ITopicSlot>> slots_;
     std::unordered_map<TopicId, const std::type_info*> topic_types_;
 
-    // Wildcard subscriptions
-    struct WildcardEntry {
-        std::string pattern;
-        const std::type_info* type;
-        std::shared_ptr<ITopicSlot> slot;
-        SubscriptionId sub_id;
-    };
+    // Wildcard subscriptions (trie-indexed)
     std::shared_mutex wildcards_mutex_;
-    std::vector<WildcardEntry> wildcard_entries_;
+    WildcardTrie wildcard_trie_;
 
     struct SubInfo {
         TopicId tid;
@@ -444,6 +453,10 @@ private:
     std::atomic<SubscriptionId> next_id_{0};
     std::atomic<bool> running_{false};
     TopicRegistry registry_;
+
+    // Condition variable for dispatch/router threads (replaces sleep backoff)
+    std::mutex cv_mutex_;
+    std::condition_variable cv_;
 };
 
 } // namespace msgbus

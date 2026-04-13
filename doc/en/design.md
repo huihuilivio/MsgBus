@@ -96,6 +96,7 @@ MsgBus/
 │       ├── topic_matcher.h            # MQTT-style topic wildcard matching
 │       ├── topic_registry.h           # TopicId ↔ string thread-safe registry
 │       ├── topic_slot.h               # TopicSlot<T> COW subscription management
+│       ├── wildcard_trie.h            # Wildcard trie index (O(depth) matching)
 │       └── message_bus.h              # MessageBus core + pool + multi-dispatcher + wildcards + coroutines + TopicRegistry
 ├── examples/
 │   ├── CMakeLists.txt
@@ -314,7 +315,46 @@ bool isWildcard(std::string_view pattern);
 
 ---
 
-### 4.7 TopicSlot — COW Subscription Management
+### 4.7 WildcardTrie — Wildcard Trie Index
+
+**File**: `include/msgbus/wildcard_trie.h`
+
+Builds a trie from wildcard subscription patterns indexed by topic levels. On dispatch, the trie is walked with the concrete topic's levels, achieving **O(topic depth)** complexity instead of O(N).
+
+```cpp
+class WildcardTrie {
+public:
+    void insert(const Entry& entry);       // Insert wildcard pattern
+    bool remove(SubscriptionId id);        // Remove by subscription ID
+    void match(std::string_view topic,     // Find matching slots
+               const std::type_info& type,
+               std::vector<ITopicSlot*>& out) const;
+    bool empty() const;
+};
+```
+
+**Matching Algorithm**:
+
+```
+matchNode(node, levels, depth):
+  1. Check node's '#' child → matches all remaining levels (terminal)
+  2. depth == levels.size() → check entries at current node
+  3. Check exact-match child levels[depth] → recurse depth+1
+  4. Check '*' child → recurse depth+1 (skip one level)
+```
+
+**Key Design**:
+
+| Feature | Implementation |
+|---|---|
+| Complexity | O(topic depth), independent of pattern count |
+| Scalability | 100 patterns vs 1000 patterns: same QPS (~1.6M) |
+| Thread safety | External shared_mutex protection (read-write separation) |
+| Memory | `unordered_map<string, unique_ptr<Node>>` tree structure |
+
+---
+
+### 4.8 TopicSlot — COW Subscription Management
 
 **File**: `include/msgbus/topic_slot.h`
 
@@ -349,7 +389,7 @@ dispatch:
 
 ---
 
-### 4.8 MessageBus — Core Bus
+### 4.9 MessageBus — Core Bus
 
 **File**: `include/msgbus/message_bus.h`
 
@@ -388,8 +428,8 @@ public:
 
 ```
 1. Exact match: slots_[topic_id] → TopicSlot<T>::dispatch() (integer hash lookup)
-2. Wildcard match: registry_.to_string(topic_id) → iterate wildcard_entries_
-   → topicMatches(pattern, topic_sv) → WildcardEntry::slot->dispatch()
+2. Wildcard match: registry_.to_string(topic_id) → WildcardTrie::match()
+   → O(topic depth) trie traversal, returns matching slot list
 ```
 
 **Single-Thread Dispatcher (num_dispatchers == 1)**:
@@ -398,7 +438,7 @@ public:
 dispatchLoop():
   idle count < kSpinThreshold(64)   → spin (lowest latency)
   idle count < kYieldThreshold(256) → yield (give up CPU)
-  idle count ≥ kYieldThreshold      → sleep kSleepMicroseconds(50)μs (save CPU)
+  idle count ≥ kYieldThreshold      → condition_variable wait (woken by publish notify)
   message arrives                   → immediately reset count, back to spin
 ```
 
@@ -433,7 +473,7 @@ Workers enter a wait loop after `running_=false`, only doing final drain and exi
 
 ---
 
-### 4.9 AsyncWaitAwaitable — Coroutine Support
+### 4.10 AsyncWaitAwaitable — Coroutine Support
 
 ```cpp
 template <typename T>
@@ -473,7 +513,7 @@ co_await bus.async_wait<T>(topic)
 | `subscribe` (wildcard) | shared_mutex write lock | Append WildcardEntry |
 | `unsubscribe` | mutex / shared_mutex | Same as above |
 | `dispatch` (exact) | **Read lock-free** | TopicId integer hash lookup; only shared_ptr copy under lock; iteration lock-free |
-| `dispatch` (wildcard) | shared_mutex read lock | Iterate wildcard_entries_ for matching |
+| `dispatch` (wildcard) | shared_mutex read lock | Trie traversal O(depth), independent of pattern count |
 | Topic lookup | shared_mutex read lock | TopicId integer-key hash table lookup, read-heavy |
 | TopicRegistry resolve | shared_lock / unique_lock | Already registered: shared_lock only; first registration: unique_lock |
 | Router routing | **Fully lock-free** | hash(TopicId) + CAS into worker queue |
@@ -516,6 +556,8 @@ co_await bus.async_wait<T>(topic)
 * Object pool + `reset()`: message object reuse avoids construct/destruct overhead
 * Recycler function pointer: zero virtual function overhead recycle path
 * TopicId integer routing: dispatch/route paths use `uint32_t` instead of `std::string` hash/compare
+* Wildcard trie index: O(topic depth) matching replaces O(N) linear scan
+* Condition variable backoff: replaces sleep, idle threads woken quickly by publish notify
 
 ---
 
@@ -526,7 +568,9 @@ co_await bus.async_wait<T>(topic)
 | ~~Multi-thread dispatcher~~ | ~~P2~~ | ✅ Done | Topic hash sharding to thread pool |
 | ~~Zero-copy optimization~~ | ~~P3~~ | ✅ Done | Object pool + intrusive ref count |
 | ~~Topic wildcards~~ | ~~P3~~ | ✅ Done | MQTT-style `*` / `#` |
-| ~~TopicId integer routing~~ | ~~P2~~ | ✅ Done | TopicRegistry + uint32_t replaces string, multi-topic +26% |
+| ~~TopicId integer routing~~ | ~~P2~~ | ✅ Done | TopicRegistry + uint32_t replaces string, multi-topic +86% |
+| ~~Wildcard trie index~~ | ~~P2~~ | ✅ Done | O(depth) matching, independent of pattern count |
+| ~~Condition variable backoff~~ | ~~P2~~ | ✅ Done | Replaces sleep, p50 latency ~7x |
 | Backpressure | P2 | Planned | Rate limiting strategy when publish returns false |
 | Batch consumption | P2 | Planned | Dequeue multiple at once, reduce scheduling overhead |
 | Priority queue | P3 | Planned | Message priorities |
@@ -558,6 +602,18 @@ co_await bus.async_wait<T>(topic)
 - [x] slots_ / topic_types_ keyed by TopicId (integer hash)
 - [x] routeToWorker uses hash(TopicId) routing
 - [x] Wildcard unsubscribe without string reverse lookup (SubInfo flag distinction)
+
+### Wildcard Trie Index
+- [x] WildcardTrie (trie built from topic levels)
+- [x] Matching complexity O(depth), independent of pattern count
+- [x] Replaces wildcard_entries_ linear scan
+- [x] WildcardTrie unit tests (7 cases)
+
+### Condition Variable Backoff
+- [x] dispatch/router/worker threads use condition_variable instead of sleep
+- [x] publish notifies dispatcher via notify_one
+- [x] routeToWorker notifies corresponding worker
+- [x] stop() wakes all threads via notify_all
 
 ### Multi-Dispatcher
 - [x] Router thread (hash sharding)
@@ -592,9 +648,9 @@ co_await bus.async_wait<T>(topic)
 - [ ] Metrics (queue depth, latency)
 
 ### Engineering
-- [x] Unit tests (59 GTest cases)
+- [x] Unit tests (66 GTest cases)
 - [x] Code coverage (OpenCppCoverage / lcov, 96.1%)
-- [x] Benchmarks (6 scenarios)
+- [x] Benchmarks (8 scenarios)
 - [x] GitHub Actions CI (Windows/Linux/macOS, UT gate)
 - [x] Release workflow (tag pre-release + benchmarks + source archive)
 - [x] Documentation (design doc + usage doc + benchmark doc)
