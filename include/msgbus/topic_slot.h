@@ -57,7 +57,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             subs = subscribers_;
         }
-        auto typed = std::static_pointer_cast<TypedMessage<T>>(msg);
+        auto* typed = static_cast<TypedMessage<T>*>(msg.get());
         for (const auto& sub : *subs) {
             try {
                 sub.handler(typed->data_);
