@@ -1,9 +1,112 @@
-# MessageBus Design Document
+# MessageBus 设计文档
 
-This document has moved to the `doc/` directory with i18n support:
+[English](../en/design.md)
 
-- **English**: [doc/en/design.md](doc/en/design.md)
-- **中文**: [doc/zh/design.md](doc/zh/design.md)
+## 一、项目目标
+
+实现一个 **单进程、高性能、无锁（或极低锁）、支持协程的消息总线系统**，用于模块解耦与事件驱动架构。
+
+### 核心能力
+
+* 单进程内高性能通信
+* Topic（字符串）路由 + MQTT 风格通配符
+* 异步处理（无阻塞 publish）
+* 基本无锁（lock-free / wait-free）
+* 支持协程（C++20）
+* 支持订阅 / 取消订阅
+* 支持自定义消息类型
+* Zero-copy 对象池 + 侵入式引用计数
+* 多 dispatcher 线程池（topic hash 分片）
+
+---
+
+## 二、总体架构
+
+```
+                ┌───────────────────────────────────────────────────────────┐
+                │                      MessageBus                          │
+                │                                                          │
+  Producer ─────┤  publish<T>(topic, msg)                                  │
+  Producer ─────┤       │  ① 对象池获取/新建 TypedMessage                   │
+  Producer ─────┤       │  ② 设置 recycler 回调                            │
+                │       ▼                                                  │
+                │  ┌─────────────────────────┐                             │
+                │  │  Lock-Free Queue         │  MPMC Ring Buffer          │
+                │  │  (Vyukov算法)            │  容量自动对齐2^N           │
+                │  └────────┬────────────────┘                             │
+                │           │                                              │
+                │     ┌─────┴─────────────────────────────────┐            │
+                │     │ num_dispatchers == 1?                  │            │
+                │     │                                        │            │
+                │  ┌──┴──────────────┐    ┌───────────────────┴──────────┐ │
+                │  │ 单线程 Dispatch  │    │ 多线程 Dispatcher（线程池）   │ │
+                │  │ dispatchLoop()  │    │                              │ │
+                │  │ 三级退避策略     │    │  Router 线程                 │ │
+                │  │ spin→yield      │    │  hash(topic) % N → 工作队列  │ │
+                │  │ →sleep          │    │                              │ │
+                │  └──────┬──────────┘    │  Worker[0] Worker[1] ... [N] │ │
+                │         │               │  各自独立 dispatch           │ │
+                │         │               └──────────┬───────────────────┘ │
+                │         └────────┬─────────────────┘                     │
+                │                  ▼  按topic路由                          │
+                │  ┌────────────────────────────────────────┐              │
+                │  │  ① 精确匹配: TopicSlot<T> (COW 列表)   │              │
+                │  │  ② 通配符匹配: WildcardEntry 列表      │              │
+                │  │     '*' 匹配单层 / '#' 匹配多层        │              │
+                │  │  ┌────────┐ ┌────────┐ ┌───────┐      │              │
+                │  │  │ Sub 1  │ │ Sub 2  │ │Sub N  │      │              │
+                │  │  └────────┘ └────────┘ └───────┘      │              │
+                │  └────────────────────────────────────────┘              │
+                │                  │                                        │
+                │                  ▼                                        │
+                │  ┌────────────────────────────────────────┐              │
+                │  │  handler(msg) / coroutine resume        │              │
+                │  └────────────────────────────────────────┘              │
+                │                  │                                        │
+                │                  ▼  引用计数归零时                         │
+                │  ┌────────────────────────────────────────┐              │
+                │  │  ObjectPool<TypedMessage<T>> 回收复用   │              │
+                │  └────────────────────────────────────────┘              │
+                └───────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 三、项目结构
+
+```
+MsgBus/
+├── CMakeLists.txt                      # 根构建文件
+├── doc/
+│   ├── en/                             # 英文文档
+│   │   ├── README.md
+│   │   ├── design.md
+│   │   └── BENCHMARK.md
+│   └── zh/                             # 中文文档
+│       ├── README.md
+│       ├── design.md                   # 设计文档（本文件）
+│       └── BENCHMARK.md
+├── .gitignore
+├── include/
+│   └── msgbus/
+│       ├── lock_free_queue.h           # MPMC 无锁环形队列
+│       ├── message.h                   # IMessage 侵入式引用计数 + TypedMessage<T> + MessagePtr
+│       ├── object_pool.h              # 无锁对象池（freelist 回收）
+│       ├── subscriber.h               # Subscriber<T> 订阅者定义
+│       ├── topic_matcher.h            # MQTT 风格 topic 通配符匹配
+│       ├── topic_slot.h               # TopicSlot<T> COW 订阅管理
+│       └── message_bus.h              # MessageBus 核心 + 对象池 + 多dispatcher + 通配符 + 协程
+├── examples/
+│   ├── CMakeLists.txt
+│   ├── basic_example.cpp              # 基础 pub/sub 示例
+│   ├── coroutine_example.cpp          # C++20 协程示例
+│   └── wildcard_example.cpp           # 通配符订阅示例
+├── tests/
+│   ├── CMakeLists.txt
+│   ├── test_message_bus.cpp            # 单元测试（55 个 GTest 用例）
+│   └── bench_message_bus.cpp           # 性能压测（6 个基准场景）
+└── .github/
+    └── workflows/
         ├── ci.yml                      # CI: UT on push/PR (Windows/Linux/macOS)
         └── release.yml                 # Release: tag 预发布 + 压测 + 源码包
 ```
@@ -448,7 +551,7 @@ co_await bus.async_wait<T>(topic)
 - [x] GitHub Actions CI（Windows/Linux/macOS，UT 门禁）
 - [x] Release 工作流（tag 预发布 + 压测 + 源码包）
 - [x] 文档完善（设计文档 + 使用文档 + 性能文档）
-- [x] 示例代码（基础 + 协程）
+- [x] 示例代码（基础 + 协程 + 通配符）
 
 ### 待实现
 - [ ] 引入 MPMC 高性能队列（moodycamel 对比）
