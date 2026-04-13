@@ -532,9 +532,7 @@ TEST_F(MessageBusTest, PublishBeforeSubscribe) {
 
 TEST_F(MessageBusTest, QueueFullReturnsFalse) {
     MessageBus small_bus(4); // tiny queue
-    small_bus.start();
-    // Don't subscribe — messages stay in queue until dispatcher tries to deliver
-    // Fill the queue (capacity rounds up to power of 2)
+    // Do NOT start — no dispatcher draining, so the queue will actually fill
     int published = 0;
     for (int i = 0; i < 100; ++i) {
         if (!small_bus.publish<int>("full", i)) break;
