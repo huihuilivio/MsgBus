@@ -105,7 +105,7 @@ MsgBus/
 │   └── wildcard_example.cpp           # Wildcard subscription example
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # Unit tests (73 GTest cases)
+│   ├── test_message_bus.cpp            # Unit tests (80 GTest cases)
 │   └── bench_message_bus.cpp           # Benchmarks (8 scenarios)
 └── .github/
     └── workflows/
@@ -610,7 +610,7 @@ co_await bus.async_wait<T>(topic)
 - [x] WildcardTrie (trie built from topic levels)
 - [x] Matching complexity O(depth), independent of pattern count
 - [x] Replaces wildcard_entries_ linear scan
-- [x] WildcardTrie unit tests (10 cases)
+- [x] WildcardTrie unit tests (12 cases)
 - [x] Transparent hash (`SVHash`/`SVEqual`) for zero-allocation `find(string_view)`
 - [x] O(1) `entry_count_` replaces recursive `isEmpty()` traversal
 - [x] `remove()` auto-prunes empty trie nodes (prevents memory leak)
@@ -659,8 +659,8 @@ co_await bus.async_wait<T>(topic)
 - [ ] Metrics (queue depth, latency)
 
 ### Engineering
-- [x] Unit tests (73 GTest cases)
-- [x] Code coverage (OpenCppCoverage / lcov, 96.1%)
+- [x] Unit tests (80 GTest cases)
+- [x] Code coverage (OpenCppCoverage / lcov, 98.2%)
 - [x] Benchmarks (8 scenarios)
 - [x] GitHub Actions CI (Windows/Linux/macOS, UT gate)
 - [x] Release workflow (tag pre-release + benchmarks + source archive)

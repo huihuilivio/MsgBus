@@ -105,7 +105,7 @@ MsgBus/
 │   └── wildcard_example.cpp           # 通配符订阅示例
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # 单元测试（73 个 GTest 用例）
+│   ├── test_message_bus.cpp            # 单元测试（80 个 GTest 用例）
 │   └── bench_message_bus.cpp           # 性能压测（8 个基准场景）
 └── .github/
     └── workflows/
@@ -610,7 +610,7 @@ co_await bus.async_wait<T>(topic)
 - [x] 实现 WildcardTrie（按 topic 层级建立 Trie 树）
 - [x] 匹配复杂度 O(depth)，与模式数量无关
 - [x] 替代 wildcard_entries_ 线性扫描
-- [x] WildcardTrie 单元测试（10 个用例）
+- [x] WildcardTrie 单元测试（12 个用例）
 - [x] 透明哈希（`SVHash`/`SVEqual`）实现 `find(string_view)` 零分配
 - [x] O(1) `entry_count_` 替代递归 `isEmpty()` 遍历
 - [x] `remove()` 后自动修剪空 Trie 节点（防内存泄漏）
@@ -659,8 +659,8 @@ co_await bus.async_wait<T>(topic)
 - [ ] metrics（队列长度、延迟）
 
 ### 工程化
-- [x] 单元测试（73 个 GTest 用例）
-- [x] 代码覆盖率统计（OpenCppCoverage / lcov，96.1%）
+- [x] 单元测试（80 个 GTest 用例）
+- [x] 代码覆盖率统计（OpenCppCoverage / lcov，98.2%）
 - [x] 性能压测（8 个基准场景）
 - [x] GitHub Actions CI（Windows/Linux/macOS，UT 门禁）
 - [x] Release 工作流（tag 预发布 + 压测 + 源码包）
