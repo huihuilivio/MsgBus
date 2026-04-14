@@ -19,7 +19,8 @@ namespace msgbus {
 /// instead of O(N) linear scan over all wildcard entries.
 ///
 /// Uses RCU (Read-Copy-Update) internally:
-///   - Read path (match/empty): atomic load of snapshot pointer (lock-free),
+///   - Read path (match/empty): atomic load of snapshot pointer (lock-free
+///     where std::atomic<shared_ptr> is available; brief mutex otherwise),
 ///     then traverses immutable data with no locks held.
 ///   - Write path (insert/remove): serialized by mutex, deep-copies the
 ///     snapshot, modifies the copy, atomically publishes it.
@@ -119,14 +120,33 @@ private:
 
     // --- RCU machinery ---
 
-    /// Load the current immutable snapshot (lock-free).
+    // Feature detection: std::atomic<std::shared_ptr<T>> requires C++20 library
+    // support (__cpp_lib_atomic_shared_ptr). Available on MSVC 19.28+, GCC 12+,
+    // libstdc++ 12+. NOT available on Apple Clang / libc++ as of Xcode 16.
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+#define MSGBUS_HAS_ATOMIC_SHARED_PTR 1
+#else
+#define MSGBUS_HAS_ATOMIC_SHARED_PTR 0
+#endif
+
+    /// Load the current immutable snapshot.
     std::shared_ptr<const Snapshot> loadSnapshot() const {
+#if MSGBUS_HAS_ATOMIC_SHARED_PTR
         return snapshot_.load(std::memory_order_acquire);
+#else
+        std::lock_guard<std::mutex> lk(rcu_mutex_);
+        return snapshot_;
+#endif
     }
 
     /// Publish a new snapshot (called under write_mutex_).
     void publishSnapshot(std::shared_ptr<const Snapshot> s) {
+#if MSGBUS_HAS_ATOMIC_SHARED_PTR
         snapshot_.store(std::move(s), std::memory_order_release);
+#else
+        std::lock_guard<std::mutex> lk(rcu_mutex_);
+        snapshot_ = std::move(s);
+#endif
     }
 
     /// Deep-clone current snapshot for COW modification.
@@ -224,8 +244,15 @@ private:
         return false;
     }
 
-    std::atomic<std::shared_ptr<const Snapshot>> snapshot_;  // RCU: lock-free read via atomic load
+#if MSGBUS_HAS_ATOMIC_SHARED_PTR
+    std::atomic<std::shared_ptr<const Snapshot>> snapshot_;  // lock-free read via atomic load
+#else
+    mutable std::mutex rcu_mutex_;                           // fallback: protects snapshot_ copy
+    std::shared_ptr<const Snapshot> snapshot_;
+#endif
     std::mutex write_mutex_;                                  // serializes COW writes
+
+#undef MSGBUS_HAS_ATOMIC_SHARED_PTR
 };
 
 } // namespace msgbus
