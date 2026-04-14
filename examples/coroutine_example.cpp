@@ -51,8 +51,10 @@ Task waitForSignal(msgbus::MessageBus& bus) {
 }
 
 int main() {
-    // Multi-dispatcher with 2 worker threads
-    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 2);
+    // Multi-dispatcher with 2 worker threads.
+    // Block policy: publish() blocks if queue is full, guarantees delivery.
+    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 2,
+                           msgbus::FullPolicy::Block);
     bus.start();
 
     // Launch coroutines (start immediately, suspend at co_await)
