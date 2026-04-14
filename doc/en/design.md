@@ -314,23 +314,41 @@ bool isWildcard(std::string_view pattern);
 
 ---
 
-### 4.7 WildcardTrie — Wildcard Trie Index
+### 4.7 WildcardTrie — Wildcard Trie Index (RCU)
 
 **File**: `include/msgbus/wildcard_trie.h`
 
 Builds a trie from wildcard subscription patterns indexed by topic levels. On dispatch, the trie is walked with the concrete topic's levels, achieving **O(topic depth)** complexity instead of O(N).
 
+Internally uses **RCU (Read-Copy-Update)** for thread safety:
+
 ```cpp
 class WildcardTrie {
 public:
-    void insert(std::string_view pattern,  // Insert wildcard pattern
+    void insert(std::string_view pattern,  // Insert wildcard pattern (RCU write)
                const Entry& entry);
-    bool remove(SubscriptionId id);        // Remove by ID (auto-prunes empty nodes)
-    void match(std::string_view topic,     // Find matching slots
+    bool remove(SubscriptionId id);        // Remove by ID (RCU write, auto-prunes empty nodes)
+    void match(std::string_view topic,     // Find matching slots (RCU read)
                const std::type_info& type,
                std::vector<ITopicSlot*>& out) const;
-    bool empty() const;                    // O(1) entry counter
+    bool empty() const;                    // RCU read, O(1)
 };
+```
+
+**RCU Mechanism**:
+
+```
+Read path (match / empty):
+  Compile-time detection of __cpp_lib_atomic_shared_ptr:
+  • Supported (MSVC/GCC): atomic<shared_ptr> load (lock-free)
+  • Unsupported (Apple Clang): mutex-guarded shared_ptr copy (very short critical section)
+  Then traverse immutable snapshot (lock-free)
+
+Write path (insert / remove):
+  1. write_mutex_ serializes writers
+  2. Deep-copy current snapshot → modify the copy
+  3. Atomic store / mutex-guarded publish of new snapshot
+  4. Old snapshot auto-reclaimed via shared_ptr ref count (grace period)
 ```
 
 **Matching Algorithm**:
@@ -349,8 +367,9 @@ matchNode(node, levels, depth):
 |---|---|
 | Complexity | O(topic depth), independent of pattern count |
 | Scalability | 100 patterns vs 1000 patterns: same QPS (~1.6M) |
-| Thread safety | External shared_mutex protection (read-write separation) |
-| Memory | `unordered_map<string, unique_ptr<Node>>` tree structure, auto-prunes empty nodes on remove |
+| Thread safety | **Internal RCU**: read path uses `atomic<shared_ptr>` load (MSVC/GCC, lock-free) or mutex fallback (Apple Clang), traversal fully lock-free |
+| Write operations | write_mutex_ serialized + deep-copy COW, consistent with TopicSlot COW style |
+| Memory | `shared_ptr<const Snapshot>` immutable snapshots, old snapshots auto-reclaimed |
 | Zero-alloc lookup | Transparent hash (`SVHash`/`SVEqual`), `find(string_view)` avoids temporary `std::string` |
 | `empty()` | O(1) `entry_count_` counter, not recursive traversal |
 
@@ -512,10 +531,10 @@ co_await bus.async_wait<T>(topic)
 |---|---|---|
 | `publish` | shared_lock | TopicRegistry resolve + pool acquire + atomic CAS enqueue |
 | `subscribe` (exact) | mutex (COW) | Low-frequency, copies entire list |
-| `subscribe` (wildcard) | shared_mutex write lock | Append WildcardEntry |
-| `unsubscribe` | mutex / shared_mutex | Same as above |
+| `subscribe` (wildcard) | mutex (RCU write) | COW deep-copy + atomic publish new snapshot |
+| `unsubscribe` | mutex / mutex (RCU write) | Same as above |
 | `dispatch` (exact) | **Read lock-free** | TopicId integer hash lookup; only shared_ptr copy under lock; iteration lock-free |
-| `dispatch` (wildcard) | shared_mutex read lock | Trie traversal O(depth), independent of pattern count |
+| `dispatch` (wildcard) | **Read lock-free / near lock-free (RCU read)** | `atomic<shared_ptr>` load (MSVC/GCC) or brief mutex (Apple Clang) + trie traversal O(depth) lock-free |
 | Topic lookup | shared_mutex read lock | TopicId integer-key hash table lookup, read-heavy |
 | TopicRegistry resolve | shared_lock / unique_lock | Already registered: shared_lock only; first registration: unique_lock |
 | Router routing | **Fully lock-free** | hash(TopicId) + CAS into worker queue |
@@ -544,7 +563,7 @@ co_await bus.async_wait<T>(topic)
 | Path | Complexity | Lock | Optimization |
 |---|---|---|---|
 | publish → registry resolve → pool acquire → enqueue | O(1) | shared_lock + lock-free | TopicId integer assign + object pool avoids heap allocation |
-| dequeue → dispatch | O(subscribers + wildcards) | Read lock-free / read lock | TopicId integer hash + COW snapshot |
+| dequeue → dispatch | O(subscribers + wildcards) | Read lock-free / RCU read | TopicId integer hash + COW snapshot + RCU snapshot |
 | subscribe | O(n) copy | mutex | Low-frequency, COW |
 
 ### Cache Friendliness
@@ -560,6 +579,7 @@ co_await bus.async_wait<T>(topic)
 * Recycler function pointer: zero virtual function overhead recycle path
 * TopicId integer routing: dispatch/route paths use `uint32_t` instead of `std::string` hash/compare
 * Wildcard trie index: O(topic depth) matching replaces O(N) linear scan
+* WildcardTrie RCU: read path copies shared_ptr only, traversal fully lock-free, eliminates multi-dispatcher read lock contention
 * Condition variable backoff: replaces sleep, idle threads woken quickly by publish notify
 
 ---
@@ -573,6 +593,7 @@ co_await bus.async_wait<T>(topic)
 | ~~Topic wildcards~~ | ~~P3~~ | ✅ Done | MQTT-style `*` / `#` |
 | ~~TopicId integer routing~~ | ~~P2~~ | ✅ Done | TopicRegistry + uint32_t replaces string, multi-topic +86% |
 | ~~Wildcard trie index~~ | ~~P2~~ | ✅ Done | O(depth) matching, independent of pattern count |
+| ~~WildcardTrie RCU~~ | ~~P2~~ | ✅ Done | Read path near lock-free, eliminates shared_mutex read contention |
 | ~~Condition variable backoff~~ | ~~P2~~ | ✅ Done | Replaces sleep, p50 latency ~7x |
 | Backpressure | P2 | Planned | Rate limiting strategy when publish returns false |
 | Batch consumption | P2 | Planned | Dequeue multiple at once, reduce scheduling overhead |
@@ -610,11 +631,13 @@ co_await bus.async_wait<T>(topic)
 - [x] WildcardTrie (trie built from topic levels)
 - [x] Matching complexity O(depth), independent of pattern count
 - [x] Replaces wildcard_entries_ linear scan
-- [x] WildcardTrie unit tests (12 cases)
+- [x] WildcardTrie unit tests (12 cases + 3 RCU cases)
 - [x] Transparent hash (`SVHash`/`SVEqual`) for zero-allocation `find(string_view)`
 - [x] O(1) `entry_count_` replaces recursive `isEmpty()` traversal
 - [x] `remove()` auto-prunes empty trie nodes (prevents memory leak)
 - [x] `insert()` accepts `string_view pattern` parameter, Entry no longer stores redundant pattern string
+- [x] RCU refactor: read path copies immutable snapshot then traverses lock-free, write path COW deep-copy + atomic publish
+- [x] Removed external `wildcards_mutex_` from MessageBus, trie is internally self-synchronized
 
 ### Condition Variable Backoff
 - [x] dispatch/router/worker threads use condition_variable instead of sleep
@@ -661,7 +684,7 @@ co_await bus.async_wait<T>(topic)
 ### Engineering
 - [x] Unit tests (80 GTest cases)
 - [x] Code coverage (OpenCppCoverage / lcov, 98.2%)
-- [x] Benchmarks (8 scenarios)
+- [x] Benchmarks (10 scenarios)
 - [x] GitHub Actions CI (Windows/Linux/macOS, UT gate)
 - [x] Release workflow (tag pre-release + benchmarks + source archive)
 - [x] Documentation (design doc + usage doc + benchmark doc)

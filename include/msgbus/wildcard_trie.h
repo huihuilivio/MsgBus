@@ -3,9 +3,10 @@
 #include "msgbus/subscriber.h"
 #include "msgbus/topic_slot.h"
 
+#include <atomic>
 #include <functional>
 #include <memory>
-#include <shared_mutex>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <typeinfo>
@@ -16,6 +17,13 @@ namespace msgbus {
 
 /// A trie that indexes wildcard subscription patterns for O(depth) lookup
 /// instead of O(N) linear scan over all wildcard entries.
+///
+/// Uses RCU (Read-Copy-Update) internally:
+///   - Read path (match/empty): atomic load of snapshot pointer (lock-free
+///     where std::atomic<shared_ptr> is available; brief mutex otherwise),
+///     then traverses immutable data with no locks held.
+///   - Write path (insert/remove): serialized by mutex, deep-copies the
+///     snapshot, modifies the copy, atomically publishes it.
 ///
 /// Structure mirrors MQTT topic levels:
 ///   "sensor/*/temp"  → ["sensor", "*", "temp"]
@@ -34,11 +42,14 @@ public:
         SubscriptionId sub_id;
     };
 
-    /// Insert a wildcard pattern. Caller must hold external write lock.
+    WildcardTrie() : snapshot_(std::make_shared<const Snapshot>()) {}
+
+    /// Insert a wildcard pattern. Thread-safe (RCU write).
     void insert(std::string_view pattern, const Entry& entry) {
+        std::lock_guard<std::mutex> lk(write_mutex_);
+        auto snap = cloneSnapshot();
         auto levels = splitLevels(pattern);
-        Node* cur = &root_;
-        ++entry_count_;
+        Node* cur = &snap->root;
         for (auto& level : levels) {
             auto it = cur->children.find(level);
             if (it == cur->children.end()) {
@@ -51,27 +62,34 @@ public:
             }
         }
         cur->entries.push_back(entry);
+        ++snap->entry_count;
+        publishSnapshot(std::move(snap));
     }
 
-    /// Remove a subscription by ID. Returns true if found.
-    /// Caller must hold external write lock.
+    /// Remove a subscription by ID. Returns true if found. Thread-safe (RCU write).
     bool remove(SubscriptionId id) {
-        bool found = removeFrom(&root_, id);
-        if (found) --entry_count_;
+        std::lock_guard<std::mutex> lk(write_mutex_);
+        auto snap = cloneSnapshot();
+        bool found = removeFrom(&snap->root, id);
+        if (found) {
+            --snap->entry_count;
+            publishSnapshot(std::move(snap));
+        }
         return found;
     }
 
-    /// Find all matching entries for a concrete topic.
-    /// Caller must hold external read lock.
+    /// Find all matching entries for a concrete topic. Thread-safe (RCU read).
     void match(std::string_view topic, const std::type_info& msg_type,
                std::vector<ITopicSlot*>& out) const {
+        auto snap = loadSnapshot();
+        if (snap->entry_count == 0) return;
         auto levels = splitLevels(topic);
-        matchNode(&root_, levels, 0, msg_type, out);
+        matchNode(&snap->root, levels, 0, msg_type, out);
     }
 
-    /// Returns true if trie has no entries at all. O(1).
+    /// Returns true if trie has no entries at all. Thread-safe (RCU read).
     bool empty() const {
-        return entry_count_ == 0;
+        return loadSnapshot()->entry_count == 0;
     }
 
 private:
@@ -94,8 +112,62 @@ private:
         std::vector<Entry> entries; // non-empty only at terminal nodes
     };
 
-    Node root_;
-    size_t entry_count_ = 0;
+    /// Immutable snapshot of the entire trie.
+    struct Snapshot {
+        Node root;
+        size_t entry_count = 0;
+    };
+
+    // --- RCU machinery ---
+
+    // Feature detection: std::atomic<std::shared_ptr<T>> requires C++20 library
+    // support (__cpp_lib_atomic_shared_ptr). Available on MSVC 19.28+, GCC 12+,
+    // libstdc++ 12+. NOT available on Apple Clang / libc++ as of Xcode 16.
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+#define MSGBUS_HAS_ATOMIC_SHARED_PTR 1
+#else
+#define MSGBUS_HAS_ATOMIC_SHARED_PTR 0
+#endif
+
+    /// Load the current immutable snapshot.
+    std::shared_ptr<const Snapshot> loadSnapshot() const {
+#if MSGBUS_HAS_ATOMIC_SHARED_PTR
+        return snapshot_.load(std::memory_order_acquire);
+#else
+        std::lock_guard<std::mutex> lk(rcu_mutex_);
+        return snapshot_;
+#endif
+    }
+
+    /// Publish a new snapshot (called under write_mutex_).
+    void publishSnapshot(std::shared_ptr<const Snapshot> s) {
+#if MSGBUS_HAS_ATOMIC_SHARED_PTR
+        snapshot_.store(std::move(s), std::memory_order_release);
+#else
+        std::lock_guard<std::mutex> lk(rcu_mutex_);
+        snapshot_ = std::move(s);
+#endif
+    }
+
+    /// Deep-clone current snapshot for COW modification.
+    std::shared_ptr<Snapshot> cloneSnapshot() const {
+        auto old = loadSnapshot();
+        auto snap = std::make_shared<Snapshot>();
+        snap->entry_count = old->entry_count;
+        cloneNode(old->root, snap->root);
+        return snap;
+    }
+
+    static void cloneNode(const Node& src, Node& dst) {
+        dst.entries = src.entries;
+        for (const auto& [key, child] : src.children) {
+            auto cloned = std::make_unique<Node>();
+            cloneNode(*child, *cloned);
+            dst.children.emplace(key, std::move(cloned));
+        }
+    }
+
+    // --- Trie algorithms ---
 
     static std::vector<std::string_view> splitLevels(std::string_view s) {
         std::vector<std::string_view> levels;
@@ -112,9 +184,9 @@ private:
         return levels;
     }
 
-    void matchNode(const Node* node, const std::vector<std::string_view>& levels,
+    static void matchNode(const Node* node, const std::vector<std::string_view>& levels,
                    size_t depth, const std::type_info& msg_type,
-                   std::vector<ITopicSlot*>& out) const {
+                   std::vector<ITopicSlot*>& out) {
         if (!node) return;
 
         // '#' child matches all remaining levels (including zero)
@@ -151,7 +223,7 @@ private:
         }
     }
 
-    bool removeFrom(Node* node, SubscriptionId id) {
+    static bool removeFrom(Node* node, SubscriptionId id) {
         // Check entries at this node
         for (auto it = node->entries.begin(); it != node->entries.end(); ++it) {
             if (it->sub_id == id) {
@@ -172,7 +244,15 @@ private:
         return false;
     }
 
+#if MSGBUS_HAS_ATOMIC_SHARED_PTR
+    std::atomic<std::shared_ptr<const Snapshot>> snapshot_;  // lock-free read via atomic load
+#else
+    mutable std::mutex rcu_mutex_;                           // fallback: protects snapshot_ copy
+    std::shared_ptr<const Snapshot> snapshot_;
+#endif
+    std::mutex write_mutex_;                                  // serializes COW writes
 
+#undef MSGBUS_HAS_ATOMIC_SHARED_PTR
 };
 
 } // namespace msgbus

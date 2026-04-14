@@ -327,6 +327,41 @@ static void benchWildcard(int num_patterns, int total_messages) {
 }
 
 // ============================================================
+// Bench 8: Wildcard trie RCU — concurrent match throughput
+// ============================================================
+static void benchWildcardRCU(int num_patterns, int total_messages, int num_readers) {
+    std::printf("\n=== Wildcard RCU: %d patterns, %d msgs, %d readers ===\n",
+                num_patterns, total_messages, num_readers);
+
+    msgbus::MessageBus bus(static_cast<size_t>(total_messages * 2), static_cast<unsigned>(num_readers));
+    std::atomic<int> received{0};
+
+    for (int p = 0; p < num_patterns; ++p) {
+        std::string pattern = "bench/rcu/" + std::to_string(p) + "/#";
+        bus.subscribe<int>(pattern, [&](const int&) {
+            received.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    bus.start();
+
+    auto t0 = Clock::now();
+    for (int i = 0; i < total_messages; ++i) {
+        while (!bus.publish<int>("bench/rcu/0/sensor/temp", i)) {
+            std::this_thread::yield();
+        }
+    }
+    while (received.load(std::memory_order_relaxed) < total_messages) {
+        std::this_thread::yield();
+    }
+    auto t1 = Clock::now();
+    bus.stop();
+
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double qps = static_cast<double>(total_messages) / (elapsed_ms / 1000.0);
+    std::printf("  Elapsed: %.2f ms  |  QPS: %.0f\n", elapsed_ms, qps);
+}
+
+// ============================================================
 // Main
 // ============================================================
 int main() {
@@ -343,6 +378,8 @@ int main() {
     benchFanOut(100, 10'000);
     benchWildcard(100, 100'000);
     benchWildcard(1000, 100'000);
+    benchWildcardRCU(100, 100'000, 4);
+    benchWildcardRCU(1000, 100'000, 4);
 
     std::printf("\nAll benchmarks completed.\n");
     return 0;
