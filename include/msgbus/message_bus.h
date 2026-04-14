@@ -36,6 +36,15 @@ inline constexpr size_t kDefaultPoolCapacity    = 8192;
 inline constexpr unsigned kSpinThreshold        = 64;
 inline constexpr unsigned kYieldThreshold       = 256;
 
+/// Queue-full policy for publish().
+enum class FullPolicy {
+    ReturnFalse,   ///< Return false immediately (default, zero overhead).
+    DropOldest,    ///< Drop the oldest message; always succeeds (SPSC + producer mutex).
+    DropNewest,    ///< Drop the new message silently; always returns true.
+    Block,         ///< Block until space is available (or bus stops).
+    BlockTimeout,  ///< Block up to a timeout, then return false.
+};
+
 /// Per-type static object pool and recycler.
 template <typename T>
 struct TypedMessagePool {
@@ -51,10 +60,17 @@ struct TypedMessagePool {
 
 class MessageBus {
 public:
-    /// @param queue_capacity  Capacity of the internal lock-free queue.
-    /// @param num_dispatchers Number of dispatcher threads (0 = auto = hardware_concurrency).
-    explicit MessageBus(size_t queue_capacity = kDefaultQueueCapacity, unsigned num_dispatchers = 1)
-        : queue_(queue_capacity)
+    /// @param queue_capacity   Capacity of the internal queue.
+    /// @param num_dispatchers  Number of dispatcher threads (0 = auto = hardware_concurrency).
+    /// @param policy           Queue-full strategy for publish().
+    /// @param publish_timeout  Timeout for FullPolicy::BlockTimeout.
+    explicit MessageBus(size_t queue_capacity = kDefaultQueueCapacity,
+                        unsigned num_dispatchers = 1,
+                        FullPolicy policy = FullPolicy::ReturnFalse,
+                        std::chrono::milliseconds publish_timeout = std::chrono::milliseconds{100})
+        : policy_(policy)
+        , publish_timeout_(publish_timeout)
+        , queue_(queue_capacity)
         , queue_capacity_(queue_capacity)
         , num_dispatchers_(num_dispatchers == 0
               ? std::max(1u, std::thread::hardware_concurrency())
@@ -95,6 +111,7 @@ public:
         if (!running_.exchange(false)) return;
         // Wake all sleeping threads
         cv_.notify_all();
+        cv_not_full_.notify_all(); // wake blocked publishers
         for (auto& wcv : worker_cvs_) wcv->notify_all();
 
         if (dispatchers_.size() > 1) {
@@ -119,7 +136,9 @@ public:
         router_drained_.store(false, std::memory_order_relaxed);
     }
 
-    /// Publish a message to a topic. Returns false if queue is full.
+    /// Publish a message to a topic.
+    /// Behavior on queue full depends on the FullPolicy set at construction.
+    /// Returns false only for ReturnFalse (queue full) or BlockTimeout (timed out).
     template <typename T>
     bool publish(std::string_view topic, T msg) {
         TopicId tid = registry_.resolve(topic);
@@ -131,10 +150,11 @@ public:
             raw = new TypedMessage<T>(tid, std::move(msg));
         }
         raw->recycler_ = &TypedMessagePool<T>::recycle;
-        bool ok = queue_.try_enqueue(MessagePtr::adopt(raw));
-        if (ok) cv_.notify_one();
-        return ok;
+        return enqueueMessage(MessagePtr::adopt(raw));
     }
+
+    /// Returns the current full policy.
+    FullPolicy policy() const { return policy_; }
 
     /// Subscribe to a topic (or wildcard pattern) with a handler.
     /// Wildcards: '*' matches one level, '#' matches zero or more trailing levels.
@@ -321,13 +341,83 @@ private:
         }
     }
 
+    // --- Main queue helpers ---
+
+    bool enqueueMessage(MessagePtr mptr) {
+        bool enqueued = false;
+        switch (policy_) {
+        case FullPolicy::ReturnFalse:
+            enqueued = queue_.try_enqueue(std::move(mptr));
+            if (enqueued) cv_.notify_one();
+            return enqueued;
+
+        case FullPolicy::DropNewest:
+            enqueued = queue_.try_enqueue(std::move(mptr));
+            if (enqueued) cv_.notify_one();
+            return true; // always report success
+
+        case FullPolicy::DropOldest: {
+            std::lock_guard<std::mutex> lk(publish_mutex_);
+            if (!queue_.try_enqueue(mptr)) { // copy (keep mptr valid for retry)
+                MessagePtr oldest;
+                queue_.try_dequeue(oldest); // discard oldest
+                // Retry — under publish_mutex_ only this producer enqueues,
+                // so after dequeue the slot is available.
+                while (!queue_.try_enqueue(std::move(mptr))) {
+                    queue_.try_dequeue(oldest);
+                }
+            }
+            cv_.notify_one();
+            return true;
+        }
+
+        case FullPolicy::Block:
+            enqueued = queue_.try_enqueue(mptr); // copy (keeps mptr valid for retry)
+            if (!enqueued) {
+                std::unique_lock<std::mutex> lk(cv_not_full_mutex_);
+                cv_not_full_.wait(lk, [&] {
+                    if (!running_.load(std::memory_order_relaxed)) return true;
+                    enqueued = queue_.try_enqueue(mptr);
+                    return enqueued;
+                });
+            }
+            if (enqueued) cv_.notify_one();
+            return enqueued;
+
+        case FullPolicy::BlockTimeout:
+            enqueued = queue_.try_enqueue(mptr);
+            if (!enqueued) {
+                std::unique_lock<std::mutex> lk(cv_not_full_mutex_);
+                cv_not_full_.wait_for(lk, publish_timeout_, [&] {
+                    if (!running_.load(std::memory_order_relaxed)) return true;
+                    enqueued = queue_.try_enqueue(mptr);
+                    return enqueued;
+                });
+            }
+            if (enqueued) cv_.notify_one();
+            return enqueued;
+        }
+        return false; // unreachable
+    }
+
+    bool mainDequeue(MessagePtr& msg) {
+        return queue_.try_dequeue(msg);
+    }
+
+    void notifyNotFull() {
+        if (policy_ == FullPolicy::Block || policy_ == FullPolicy::BlockTimeout) {
+            cv_not_full_.notify_one();
+        }
+    }
+
     // --- Single-dispatcher mode ---
     void dispatchLoop() {
         unsigned idle = 0;
         while (running_.load(std::memory_order_relaxed)) {
             MessagePtr msg;
-            if (queue_.try_dequeue(msg)) {
+            if (mainDequeue(msg)) {
                 idle = 0;
+                notifyNotFull();
                 dispatchMessage(msg);
             } else {
                 if (idle < kSpinThreshold) {
@@ -344,7 +434,8 @@ private:
         }
         // Drain remaining messages
         MessagePtr msg;
-        while (queue_.try_dequeue(msg)) {
+        while (mainDequeue(msg)) {
+            notifyNotFull();
             dispatchMessage(msg);
         }
     }
@@ -357,8 +448,9 @@ private:
         unsigned idle = 0;
         while (running_.load(std::memory_order_relaxed)) {
             MessagePtr msg;
-            if (queue_.try_dequeue(msg)) {
+            if (mainDequeue(msg)) {
                 idle = 0;
+                notifyNotFull();
                 routeToWorker(msg);
             } else {
                 if (idle < kSpinThreshold) {
@@ -376,7 +468,8 @@ private:
         // Drain main queue into worker queues.
         // Workers are still alive (stop() joins router before workers).
         MessagePtr msg;
-        while (queue_.try_dequeue(msg)) {
+        while (mainDequeue(msg)) {
+            notifyNotFull();
             routeToWorker(msg);
         }
     }
@@ -430,7 +523,17 @@ private:
         }
     }
 
+    FullPolicy policy_;
+    std::chrono::milliseconds publish_timeout_;
+
+    // Main queue (MPMC, used by all policies)
     LockFreeQueue<MessagePtr> queue_;
+    std::mutex publish_mutex_;              // serializes DropOldest dequeue+enqueue
+
+    // Backpressure signaling for Block / BlockTimeout
+    std::mutex cv_not_full_mutex_;
+    std::condition_variable cv_not_full_;
+
     size_t queue_capacity_;
     unsigned num_dispatchers_;
     std::atomic<bool> router_drained_{false};

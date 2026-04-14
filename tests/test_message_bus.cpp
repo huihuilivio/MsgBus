@@ -699,6 +699,192 @@ TEST_F(MessageBusTest, QueueFullReturnsFalse) {
     small_bus.stop();
 }
 
+// ---------- FullPolicy Tests ----------
+
+TEST(FullPolicyTest, ReturnFalseDefault) {
+    // Default policy is ReturnFalse
+    MessageBus bus(4);
+    EXPECT_EQ(bus.policy(), FullPolicy::ReturnFalse);
+    // Do NOT start — queue will fill
+    int published = 0;
+    for (int i = 0; i < 100; ++i) {
+        if (!bus.publish<int>("full", i)) break;
+        ++published;
+    }
+    EXPECT_LT(published, 100);
+}
+
+TEST(FullPolicyTest, DropNewestAlwaysReturnsTrue) {
+    MessageBus bus(4, 1, FullPolicy::DropNewest);
+    EXPECT_EQ(bus.policy(), FullPolicy::DropNewest);
+    // Do NOT start — queue will fill, but publish always returns true
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_TRUE(bus.publish<int>("drop_newest", i));
+    }
+}
+
+TEST(FullPolicyTest, DropOldestAlwaysReturnsTrue) {
+    MessageBus bus(4, 1, FullPolicy::DropOldest);
+    EXPECT_EQ(bus.policy(), FullPolicy::DropOldest);
+    // Do NOT start — queue will fill, but publish always returns true
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_TRUE(bus.publish<int>("drop_oldest", i));
+    }
+}
+
+TEST(FullPolicyTest, DropOldestKeepsNewest) {
+    MessageBus bus(4, 1, FullPolicy::DropOldest);
+    bus.start();
+
+    std::vector<int> received;
+    std::mutex mu;
+    std::condition_variable done_cv;
+
+    bus.subscribe<int>("topic", [&](const int& v) {
+        std::lock_guard<std::mutex> lk(mu);
+        received.push_back(v);
+    });
+
+    // Overflow: publish 20 messages into capacity-4 queue without giving
+    // dispatcher much time. Newest messages should survive.
+    for (int i = 0; i < 20; ++i) {
+        bus.publish<int>("topic", i);
+    }
+
+    // Wait for dispatcher to drain
+    for (int i = 0; i < 200; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::lock_guard<std::mutex> lk(mu);
+        if (received.size() >= 4) break;
+    }
+    bus.stop();
+
+    std::lock_guard<std::mutex> lk(mu);
+    // Should have received some messages, and the last ones should be the newest
+    EXPECT_GE(received.size(), 1u);
+    if (!received.empty()) {
+        // The very last received should be close to 19 (the newest published)
+        EXPECT_GE(received.back(), 16); // at least among last 4
+    }
+}
+
+TEST(FullPolicyTest, BlockReleasesOnDequeue) {
+    MessageBus bus(4, 1, FullPolicy::Block);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("block", [&](const int&) {
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    // Publish more than capacity — Block policy should let all through
+    constexpr int N = 50;
+    std::thread publisher([&] {
+        for (int i = 0; i < N; ++i) {
+            EXPECT_TRUE(bus.publish<int>("block", i));
+        }
+    });
+
+    publisher.join();
+    // Wait for all to be consumed
+    for (int i = 0; i < 200 && received.load() < N; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    bus.stop();
+    EXPECT_EQ(received.load(), N);
+}
+
+TEST(FullPolicyTest, BlockTimeoutReturnsOnTimeout) {
+    MessageBus bus(4, 1, FullPolicy::BlockTimeout, std::chrono::milliseconds{50});
+    // Do NOT start — queue will fill and timeout
+    int succeeded = 0;
+    for (int i = 0; i < 20; ++i) {
+        if (bus.publish<int>("timeout", i)) ++succeeded;
+    }
+    // First few fit, rest should timeout and return false
+    EXPECT_GT(succeeded, 0);
+    EXPECT_LT(succeeded, 20);
+}
+
+TEST(FullPolicyTest, BlockWakesOnStop) {
+    MessageBus bus(4, 1, FullPolicy::Block);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("stop_wake", [&](const int&) {
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    // Publish enough to fill the queue + backlog, then from another thread
+    // publish one more that will block when the dispatcher is paused.
+    // We achieve this by subscribing a slow handler.
+    MessageBus slow_bus(4, 1, FullPolicy::Block);
+    slow_bus.start();
+    std::atomic<bool> handler_running{false};
+    std::atomic<bool> handler_release{false};
+    slow_bus.subscribe<int>("block_topic", [&](const int&) {
+        handler_running.store(true);
+        while (!handler_release.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    });
+
+    // Publish one message to trigger the slow handler (blocks dispatcher)
+    slow_bus.publish<int>("block_topic", 0);
+    while (!handler_running.load()) std::this_thread::yield();
+
+    // Now dispatcher is stuck. Fill the queue.
+    for (int i = 0; i < 4; ++i) {
+        slow_bus.publish<int>("block_topic", i + 1);
+    }
+
+    // Next publish should block (queue full, dispatcher stuck)
+    std::atomic<bool> publish_done{false};
+    std::thread publisher([&] {
+        slow_bus.publish<int>("block_topic", 999);
+        publish_done.store(true);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(publish_done.load());
+
+    // stop() should wake the blocked publisher
+    handler_release.store(true, std::memory_order_release);
+    slow_bus.stop();
+    publisher.join();
+    EXPECT_TRUE(publish_done.load());
+}
+
+TEST(FullPolicyTest, DropOldestMultiProducer) {
+    // Multiple producers with DropOldest — no crash, no UB
+    MessageBus bus(64, 1, FullPolicy::DropOldest);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("mp", [&](const int&) {
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    constexpr int THREADS = 4;
+    constexpr int PER_THREAD = 500;
+    std::vector<std::thread> producers;
+    for (int t = 0; t < THREADS; ++t) {
+        producers.emplace_back([&, t] {
+            for (int i = 0; i < PER_THREAD; ++i) {
+                bus.publish<int>("mp", t * PER_THREAD + i);
+            }
+        });
+    }
+    for (auto& th : producers) th.join();
+
+    // Wait for drain
+    for (int i = 0; i < 200 && received.load() < PER_THREAD; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    bus.stop();
+
+    EXPECT_GT(received.load(), 0);
+}
+
 TEST_F(MessageBusTest, StartStopIdempotent) {
     // Already started in SetUp
     bus.start(); // second start should be no-op
