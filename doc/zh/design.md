@@ -339,13 +339,15 @@ public:
 
 ```
 读路径（match / empty）:
-  1. atomic load 获取 shared_ptr<const Snapshot>（无锁）
-  2. 在不可变快照上遍历 Trie（无锁）
+  编译期检测 __cpp_lib_atomic_shared_ptr:
+  • 支持（MSVC/GCC）: atomic<shared_ptr> load（无锁）
+  • 不支持（Apple Clang）: mutex 保护下拷贝 shared_ptr（极短临界区）
+  然后在不可变快照上遍历 Trie（无锁）
 
 写路径（insert / remove）:
   1. write_mutex_ 序列化写操作
   2. 深拷贝当前快照 → 修改副本
-  3. atomic store 发布新快照
+  3. atomic store / mutex 保护下发布新快照
   4. 旧快照通过 shared_ptr 引用计数自动回收（grace period）
 ```
 
@@ -365,7 +367,7 @@ matchNode(node, levels, depth):
 |------|------|
 | 复杂度 | O(topic depth)，与 pattern 数量无关 |
 | 扩展性 | 100 个 pattern vs 1000 个 pattern QPS 相同（~1.6M） |
-| 线程安全 | **内部 RCU**：读路径 `atomic<shared_ptr>` load（无锁），遍历完全无锁 |
+| 线程安全 | **内部 RCU**：读路径 `atomic<shared_ptr>` load（MSVC/GCC 无锁）或 mutex fallback（Apple Clang），遍历完全无锁 |
 | 写操作 | write_mutex_ 序列化 + 深拷贝 COW，与 TopicSlot COW 风格一致 |
 | 内存 | `shared_ptr<const Snapshot>` 不可变快照，旧快照自动回收 |
 | 查找零分配 | 透明哈希（`SVHash`/`SVEqual`），`find(string_view)` 不构造临时 `std::string` |
@@ -532,7 +534,7 @@ co_await bus.async_wait<T>(topic)
 | `subscribe` (通配符) | mutex（RCU 写） | COW 深拷贝 + 原子发布新快照 |
 | `unsubscribe` | mutex / mutex（RCU 写） | 同上 |
 | `dispatch` (精确) | **读无锁** | TopicId 整数哈希查找，仅 shared_ptr 拷贝加锁，遍历无锁 |
-| `dispatch` (通配符) | **读无锁（RCU 读）** | `atomic<shared_ptr>` load + Trie 遍历 O(depth)，全程无锁 |
+| `dispatch` (通配符) | **读无锁 / 近似无锁（RCU 读）** | `atomic<shared_ptr>` load（MSVC/GCC）或极短 mutex（Apple Clang）+ Trie 遍历 O(depth) 无锁 |
 | Topic 查找 | shared_mutex 读锁 | TopicId 整数键哈希表查找，读多写少 |
 | TopicRegistry resolve | shared_lock / unique_lock | 已注册只需 shared_lock，首次注册 unique_lock |
 | Router 路由 | **完全无锁** | hash(TopicId) + CAS 入 worker 队列 |

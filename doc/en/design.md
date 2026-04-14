@@ -339,13 +339,15 @@ public:
 
 ```
 Read path (match / empty):
-  1. Atomic load of shared_ptr<const Snapshot> (lock-free)
-  2. Traverse immutable snapshot (lock-free)
+  Compile-time detection of __cpp_lib_atomic_shared_ptr:
+  • Supported (MSVC/GCC): atomic<shared_ptr> load (lock-free)
+  • Unsupported (Apple Clang): mutex-guarded shared_ptr copy (very short critical section)
+  Then traverse immutable snapshot (lock-free)
 
 Write path (insert / remove):
   1. write_mutex_ serializes writers
   2. Deep-copy current snapshot → modify the copy
-  3. Atomic store to publish new snapshot
+  3. Atomic store / mutex-guarded publish of new snapshot
   4. Old snapshot auto-reclaimed via shared_ptr ref count (grace period)
 ```
 
@@ -365,7 +367,7 @@ matchNode(node, levels, depth):
 |---|---|
 | Complexity | O(topic depth), independent of pattern count |
 | Scalability | 100 patterns vs 1000 patterns: same QPS (~1.6M) |
-| Thread safety | **Internal RCU**: read path uses `atomic<shared_ptr>` load (lock-free), traversal fully lock-free |
+| Thread safety | **Internal RCU**: read path uses `atomic<shared_ptr>` load (MSVC/GCC, lock-free) or mutex fallback (Apple Clang), traversal fully lock-free |
 | Write operations | write_mutex_ serialized + deep-copy COW, consistent with TopicSlot COW style |
 | Memory | `shared_ptr<const Snapshot>` immutable snapshots, old snapshots auto-reclaimed |
 | Zero-alloc lookup | Transparent hash (`SVHash`/`SVEqual`), `find(string_view)` avoids temporary `std::string` |
@@ -532,7 +534,7 @@ co_await bus.async_wait<T>(topic)
 | `subscribe` (wildcard) | mutex (RCU write) | COW deep-copy + atomic publish new snapshot |
 | `unsubscribe` | mutex / mutex (RCU write) | Same as above |
 | `dispatch` (exact) | **Read lock-free** | TopicId integer hash lookup; only shared_ptr copy under lock; iteration lock-free |
-| `dispatch` (wildcard) | **Read lock-free (RCU read)** | `atomic<shared_ptr>` load + trie traversal O(depth), fully lock-free |
+| `dispatch` (wildcard) | **Read lock-free / near lock-free (RCU read)** | `atomic<shared_ptr>` load (MSVC/GCC) or brief mutex (Apple Clang) + trie traversal O(depth) lock-free |
 | Topic lookup | shared_mutex read lock | TopicId integer-key hash table lookup, read-heavy |
 | TopicRegistry resolve | shared_lock / unique_lock | Already registered: shared_lock only; first registration: unique_lock |
 | Router routing | **Fully lock-free** | hash(TopicId) + CAS into worker queue |
