@@ -79,13 +79,22 @@ public:
         return found;
     }
 
+    /// Opaque guard that keeps an internal RCU snapshot alive.
+    /// Callers must hold this while using raw ITopicSlot* from match().
+    using SnapshotGuard = std::shared_ptr<const void>;
+
     /// Find all matching entries for a concrete topic. Thread-safe (RCU read).
-    void match(std::string_view topic, const std::type_info& msg_type,
-               std::vector<ITopicSlot*>& out) const {
+    /// @return A guard that keeps the snapshot (and the raw pointers in @p out)
+    ///         alive.  Callers MUST store the returned guard until they are done
+    ///         using the pointers.
+    [[nodiscard]] SnapshotGuard match(std::string_view topic,
+                                      const std::type_info& msg_type,
+                                      std::vector<ITopicSlot*>& out) const {
         auto snap = loadSnapshot();
-        if (snap->entry_count == 0) return;
+        if (snap->entry_count == 0) return {};
         auto levels = splitLevels(topic);
         matchNode(&snap->root, levels, 0, msg_type, out);
+        return snap;
     }
 
     /// Returns true if trie has no entries at all. Thread-safe (RCU read).
