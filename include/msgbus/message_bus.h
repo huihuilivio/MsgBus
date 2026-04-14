@@ -401,11 +401,13 @@ private:
 
         // 2. Wildcard-match dispatch via trie (RCU: no external lock needed)
         //    Uses cached topic_sv from publish() — no registry reverse lookup.
+        //    The guard keeps the trie snapshot alive so the raw ITopicSlot*
+        //    pointers remain valid throughout the dispatch loop.
         {
             std::string_view topic_sv = msg->topic_sv();
             thread_local std::vector<ITopicSlot*> matched;
             matched.clear();
-            wildcard_trie_.match(topic_sv, msg->type(), matched);
+            auto wc_guard = wildcard_trie_.match(topic_sv, msg->type(), matched);
             for (auto* slot : matched) {
                 slot->dispatch(msg);
             }

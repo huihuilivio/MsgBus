@@ -1227,15 +1227,15 @@ TEST(WildcardTrieTest, SingleLevelMatch) {
     trie.insert("sensor/*/temp", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
-    trie.match("sensor/1/temp", typeid(int), matched);
+    (void)trie.match("sensor/1/temp", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 
     matched.clear();
-    trie.match("sensor/1/humidity", typeid(int), matched);
+    (void)trie.match("sensor/1/humidity", typeid(int), matched);
     EXPECT_EQ(matched.size(), 0u);
 
     matched.clear();
-    trie.match("sensor/1/2/temp", typeid(int), matched);
+    (void)trie.match("sensor/1/2/temp", typeid(int), matched);
     EXPECT_EQ(matched.size(), 0u);
 }
 
@@ -1246,19 +1246,19 @@ TEST(WildcardTrieTest, MultiLevelMatch) {
     trie.insert("sensor/#", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
-    trie.match("sensor/temp", typeid(int), matched);
+    (void)trie.match("sensor/temp", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 
     matched.clear();
-    trie.match("sensor/a/b/c", typeid(int), matched);
+    (void)trie.match("sensor/a/b/c", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 
     matched.clear();
-    trie.match("sensor", typeid(int), matched);
+    (void)trie.match("sensor", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 
     matched.clear();
-    trie.match("other/thing", typeid(int), matched);
+    (void)trie.match("other/thing", typeid(int), matched);
     EXPECT_EQ(matched.size(), 0u);
 }
 
@@ -1269,15 +1269,15 @@ TEST(WildcardTrieTest, MixedWildcards) {
     trie.insert("a/*/c/#", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
-    trie.match("a/b/c/d/e", typeid(int), matched);
+    (void)trie.match("a/b/c/d/e", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 
     matched.clear();
-    trie.match("a/x/c", typeid(int), matched);
+    (void)trie.match("a/x/c", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 
     matched.clear();
-    trie.match("a/b/d", typeid(int), matched);
+    (void)trie.match("a/b/d", typeid(int), matched);
     EXPECT_EQ(matched.size(), 0u);
 }
 
@@ -1292,7 +1292,7 @@ TEST(WildcardTrieTest, MultiplePatterns) {
     trie.insert("sensor/*/temp", {&typeid(int), slot2, 2});
 
     std::vector<ITopicSlot*> matched;
-    trie.match("sensor/1/temp", typeid(int), matched);
+    (void)trie.match("sensor/1/temp", typeid(int), matched);
     EXPECT_EQ(matched.size(), 2u); // both patterns match
 }
 
@@ -1307,7 +1307,7 @@ TEST(WildcardTrieTest, RemoveEntry) {
     EXPECT_TRUE(trie.empty());
 
     std::vector<ITopicSlot*> matched;
-    trie.match("sensor/temp", typeid(int), matched);
+    (void)trie.match("sensor/temp", typeid(int), matched);
     EXPECT_EQ(matched.size(), 0u);
 }
 
@@ -1318,11 +1318,11 @@ TEST(WildcardTrieTest, TypeFiltering) {
     trie.insert("data/#", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
-    trie.match("data/x", typeid(int), matched);
+    (void)trie.match("data/x", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 
     matched.clear();
-    trie.match("data/x", typeid(std::string), matched);
+    (void)trie.match("data/x", typeid(std::string), matched);
     EXPECT_EQ(matched.size(), 0u); // type mismatch
 }
 
@@ -1333,11 +1333,11 @@ TEST(WildcardTrieTest, HashMatchesRoot) {
     trie.insert("#", {&typeid(int), slot, 1});
 
     std::vector<ITopicSlot*> matched;
-    trie.match("anything/at/all", typeid(int), matched);
+    (void)trie.match("anything/at/all", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 
     matched.clear();
-    trie.match("x", typeid(int), matched);
+    (void)trie.match("x", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 }
 
@@ -1358,7 +1358,7 @@ TEST(WildcardTrieTest, EmptyNodePruning) {
     trie.insert("a/b/c/d", {&typeid(int), slot2, 2});
 
     std::vector<ITopicSlot*> matched;
-    trie.match("a/b/c/d", typeid(int), matched);
+    (void)trie.match("a/b/c/d", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 }
 
@@ -1376,11 +1376,11 @@ TEST(WildcardTrieTest, PartialPruning) {
     EXPECT_TRUE(trie.remove(1)); // remove a/b/c, prune 'c' node but keep 'a/b'
 
     std::vector<ITopicSlot*> matched;
-    trie.match("a/b/c", typeid(int), matched);
+    (void)trie.match("a/b/c", typeid(int), matched);
     EXPECT_EQ(matched.size(), 0u); // removed
 
     matched.clear();
-    trie.match("a/b/d", typeid(int), matched);
+    (void)trie.match("a/b/d", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u); // still alive
 }
 
@@ -1453,7 +1453,7 @@ TEST(WildcardTrieTest, ConcurrentReadWrite) {
         readers.emplace_back([&] {
             for (int i = 0; i < READ_ITERS; ++i) {
                 std::vector<ITopicSlot*> matched;
-                trie.match("pre/5/sensor/temp", typeid(int), matched);
+                (void)trie.match("pre/5/sensor/temp", typeid(int), matched);
                 total_matches.fetch_add(static_cast<int>(matched.size()),
                                         std::memory_order_relaxed);
             }
@@ -1480,19 +1480,19 @@ TEST(WildcardTrieTest, SnapshotIsolation) {
 
     // Take a snapshot via match before any concurrent insert
     std::vector<ITopicSlot*> before;
-    trie.match("snap/a/b", typeid(int), before);
+    (void)trie.match("snap/a/b", typeid(int), before);
     EXPECT_EQ(before.size(), 1u);
 
     // Insert more, then match again
     trie.insert("snap/a/#", {&typeid(int), make_slot(2), 2});
     std::vector<ITopicSlot*> after;
-    trie.match("snap/a/b", typeid(int), after);
+    (void)trie.match("snap/a/b", typeid(int), after);
     EXPECT_EQ(after.size(), 2u);
 
     // Remove first, should only see second
     trie.remove(1);
     std::vector<ITopicSlot*> final_match;
-    trie.match("snap/a/b", typeid(int), final_match);
+    (void)trie.match("snap/a/b", typeid(int), final_match);
     EXPECT_EQ(final_match.size(), 1u);
 }
 
@@ -1516,7 +1516,7 @@ TEST(WildcardTrieTest, InsertAfterFullRemoval) {
     EXPECT_FALSE(trie.empty());
 
     std::vector<ITopicSlot*> matched;
-    trie.match("cycle/x/y", typeid(int), matched);
+    (void)trie.match("cycle/x/y", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u);
 }
 
@@ -1758,11 +1758,11 @@ TEST(WildcardTrieTest, RemoveDeepNestedChild) {
     EXPECT_TRUE(trie.remove(1));
 
     std::vector<ITopicSlot*> matched;
-    trie.match("a/b/c/x/e", typeid(int), matched);
+    (void)trie.match("a/b/c/x/e", typeid(int), matched);
     EXPECT_EQ(matched.size(), 0u); // removed
 
     matched.clear();
-    trie.match("a/b/c/d/f", typeid(int), matched);
+    (void)trie.match("a/b/c/d/f", typeid(int), matched);
     EXPECT_EQ(matched.size(), 1u); // still alive
 }
 
