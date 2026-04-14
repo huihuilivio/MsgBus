@@ -12,8 +12,8 @@ target_include_directories(msgbus INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
-# GCC needs -fcoroutines for C++20 coroutine support
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+# GCC/Clang may need -fcoroutines for C++20 coroutine support
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(msgbus INTERFACE -fcoroutines)
 endif()
 
