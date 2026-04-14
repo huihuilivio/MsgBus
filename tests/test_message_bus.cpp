@@ -1,5 +1,6 @@
 #include "msgbus/message_bus.h"
 #include "msgbus/object_pool.h"
+#include "msgbus/spsc_queue.h"
 #include "msgbus/topic_matcher.h"
 #include "msgbus/topic_registry.h"
 #include "msgbus/wildcard_trie.h"
@@ -379,6 +380,166 @@ TEST(LockFreeQueueTest, CapacityRounding) {
     EXPECT_TRUE(q.try_enqueue(3));
     EXPECT_TRUE(q.try_enqueue(4)); // 4 (rounded up from 3)
     EXPECT_FALSE(q.try_enqueue(5)); // full
+}
+
+// ---------- SPSCQueue Tests ----------
+
+TEST(SPSCQueueTest, EnqueueDequeue) {
+    SPSCQueue<int> q(4);
+    EXPECT_TRUE(q.try_enqueue(10));
+    int val = 0;
+    EXPECT_TRUE(q.try_dequeue(val));
+    EXPECT_EQ(val, 10);
+}
+
+TEST(SPSCQueueTest, FIFO) {
+    SPSCQueue<int> q(8);
+    for (int i = 0; i < 5; ++i) EXPECT_TRUE(q.try_enqueue(i));
+    for (int i = 0; i < 5; ++i) {
+        int val = -1;
+        EXPECT_TRUE(q.try_dequeue(val));
+        EXPECT_EQ(val, i);
+    }
+}
+
+TEST(SPSCQueueTest, FullQueue) {
+    SPSCQueue<int> q(4); // rounds to 4
+    EXPECT_TRUE(q.try_enqueue(1));
+    EXPECT_TRUE(q.try_enqueue(2));
+    EXPECT_TRUE(q.try_enqueue(3));
+    EXPECT_TRUE(q.try_enqueue(4));
+    EXPECT_FALSE(q.try_enqueue(5)); // full
+}
+
+TEST(SPSCQueueTest, EmptyQueue) {
+    SPSCQueue<int> q(4);
+    int val = 0;
+    EXPECT_FALSE(q.try_dequeue(val)); // empty
+}
+
+TEST(SPSCQueueTest, CapacityRounding) {
+    SPSCQueue<int> q(3); // rounds to 4
+    EXPECT_EQ(q.capacity(), 4u);
+    for (int i = 0; i < 4; ++i) EXPECT_TRUE(q.try_enqueue(i));
+    EXPECT_FALSE(q.try_enqueue(99));
+}
+
+TEST(SPSCQueueTest, OverwriteDropsOldest) {
+    SPSCQueue<int> q(4);
+    // Fill to capacity
+    for (int i = 1; i <= 4; ++i) q.enqueue_overwrite(i);
+    // Overwrite: should drop oldest (1), then insert 5
+    q.enqueue_overwrite(5);
+
+    // Should get 2, 3, 4, 5 (oldest=1 was dropped)
+    int val = 0;
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 2);
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 3);
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 4);
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 5);
+    EXPECT_FALSE(q.try_dequeue(val)); // empty
+}
+
+TEST(SPSCQueueTest, OverwriteMultipleDrops) {
+    SPSCQueue<int> q(4);
+    // Fill with 1..4
+    for (int i = 1; i <= 4; ++i) q.enqueue_overwrite(i);
+    // Overwrite 3 more: drops 1, 2, 3
+    q.enqueue_overwrite(5);
+    q.enqueue_overwrite(6);
+    q.enqueue_overwrite(7);
+
+    // Should get 4, 5, 6, 7
+    int val = 0;
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 4);
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 5);
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 6);
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 7);
+    EXPECT_FALSE(q.try_dequeue(val));
+}
+
+TEST(SPSCQueueTest, OverwriteWrapAround) {
+    SPSCQueue<int> q(4);
+    // Fill and drain several rounds to wrap around
+    for (int round = 0; round < 5; ++round) {
+        for (int i = 0; i < 4; ++i) q.enqueue_overwrite(round * 10 + i);
+        int val;
+        for (int i = 0; i < 4; ++i) EXPECT_TRUE(q.try_dequeue(val));
+    }
+    // Fill again and overwrite
+    for (int i = 1; i <= 4; ++i) q.enqueue_overwrite(i);
+    q.enqueue_overwrite(5);
+    int val = 0;
+    EXPECT_TRUE(q.try_dequeue(val)); EXPECT_EQ(val, 2);
+}
+
+TEST(SPSCQueueTest, ConcurrentProducerConsumer) {
+    SPSCQueue<int> q(1024);
+    constexpr int N = 100'000;
+    std::atomic<long long> sum{0};
+
+    std::thread producer([&] {
+        for (int i = 1; i <= N; ++i) {
+            while (!q.try_enqueue(i)) std::this_thread::yield();
+        }
+    });
+
+    std::thread consumer([&] {
+        int received = 0;
+        while (received < N) {
+            int val;
+            if (q.try_dequeue(val)) {
+                sum.fetch_add(val, std::memory_order_relaxed);
+                ++received;
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    producer.join();
+    consumer.join();
+
+    long long expected = static_cast<long long>(N) * (N + 1) / 2;
+    EXPECT_EQ(sum.load(), expected);
+}
+
+TEST(SPSCQueueTest, ConcurrentOverwrite) {
+    // Producer overwrites while consumer drains — no crash, no UB
+    SPSCQueue<int> q(16);
+    constexpr int N = 50'000;
+    std::atomic<bool> done{false};
+    std::atomic<int> consumed{0};
+
+    std::thread producer([&] {
+        for (int i = 0; i < N; ++i) {
+            q.enqueue_overwrite(i);
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    std::thread consumer([&] {
+        int val;
+        while (!done.load(std::memory_order_acquire) || q.size_approx() > 0) {
+            if (q.try_dequeue(val)) {
+                consumed.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        // Final drain
+        while (q.try_dequeue(val)) {
+            consumed.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    producer.join();
+    consumer.join();
+
+    // Some messages may be dropped due to overwrite, but we should have
+    // consumed at least some and no more than N.
+    EXPECT_GT(consumed.load(), 0);
+    EXPECT_LE(consumed.load(), N);
 }
 
 // ---------- MessageBus Basic Tests ----------
