@@ -1051,6 +1051,115 @@ TEST(WildcardTrieTest, EntryCountAccuracy) {
     EXPECT_TRUE(trie.empty()); // count should not go negative / underflow
 }
 
+// ---------- WildcardTrie RCU Tests ----------
+
+TEST(WildcardTrieTest, ConcurrentReadWrite) {
+    // Multiple readers + one writer concurrently — RCU must not crash or lose data
+    WildcardTrie trie;
+    constexpr int NUM_PATTERNS = 100;
+    constexpr int NUM_READERS  = 4;
+    constexpr int READ_ITERS   = 2000;
+
+    // Pre-insert some patterns so readers always have something to match
+    auto make_slot = [](SubscriptionId id) {
+        auto slot = std::make_shared<TopicSlot<int>>();
+        slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), id);
+        return slot;
+    };
+    for (int i = 0; i < 10; ++i) {
+        trie.insert("pre/" + std::to_string(i) + "/#",
+                     {&typeid(int), make_slot(static_cast<SubscriptionId>(i + 1)),
+                      static_cast<SubscriptionId>(i + 1)});
+    }
+
+    std::atomic<bool> stop{false};
+
+    // Writer: continuously insert and remove patterns
+    std::thread writer([&] {
+        for (int i = 10; i < NUM_PATTERNS && !stop.load(); ++i) {
+            auto id = static_cast<SubscriptionId>(i + 1);
+            trie.insert("rcu/" + std::to_string(i) + "/#",
+                         {&typeid(int), make_slot(id), id});
+        }
+        for (int i = 10; i < NUM_PATTERNS && !stop.load(); ++i) {
+            trie.remove(static_cast<SubscriptionId>(i + 1));
+        }
+    });
+
+    // Readers: continuously match topics while writer mutates the trie
+    std::vector<std::thread> readers;
+    std::atomic<int> total_matches{0};
+    for (int r = 0; r < NUM_READERS; ++r) {
+        readers.emplace_back([&] {
+            for (int i = 0; i < READ_ITERS; ++i) {
+                std::vector<ITopicSlot*> matched;
+                trie.match("pre/5/sensor/temp", typeid(int), matched);
+                total_matches.fetch_add(static_cast<int>(matched.size()),
+                                        std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (auto& t : readers) t.join();
+    writer.join();
+
+    // Every reader iteration should have matched the pre-inserted pattern
+    EXPECT_GE(total_matches.load(), NUM_READERS * READ_ITERS);
+}
+
+TEST(WildcardTrieTest, SnapshotIsolation) {
+    // A match() in progress sees a consistent snapshot even if insert() happens concurrently
+    WildcardTrie trie;
+    auto make_slot = [](SubscriptionId id) {
+        auto slot = std::make_shared<TopicSlot<int>>();
+        slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), id);
+        return slot;
+    };
+
+    trie.insert("snap/#", {&typeid(int), make_slot(1), 1});
+
+    // Take a snapshot via match before any concurrent insert
+    std::vector<ITopicSlot*> before;
+    trie.match("snap/a/b", typeid(int), before);
+    EXPECT_EQ(before.size(), 1u);
+
+    // Insert more, then match again
+    trie.insert("snap/a/#", {&typeid(int), make_slot(2), 2});
+    std::vector<ITopicSlot*> after;
+    trie.match("snap/a/b", typeid(int), after);
+    EXPECT_EQ(after.size(), 2u);
+
+    // Remove first, should only see second
+    trie.remove(1);
+    std::vector<ITopicSlot*> final_match;
+    trie.match("snap/a/b", typeid(int), final_match);
+    EXPECT_EQ(final_match.size(), 1u);
+}
+
+TEST(WildcardTrieTest, InsertAfterFullRemoval) {
+    // RCU: after removing all entries and re-inserting, match still works
+    WildcardTrie trie;
+    auto make_slot = [](SubscriptionId id) {
+        auto slot = std::make_shared<TopicSlot<int>>();
+        slot->addSubscriber(std::function<void(const int&)>([](const int&) {}), id);
+        return slot;
+    };
+
+    trie.insert("cycle/#", {&typeid(int), make_slot(1), 1});
+    EXPECT_FALSE(trie.empty());
+
+    trie.remove(1);
+    EXPECT_TRUE(trie.empty());
+
+    // Re-insert on same path
+    trie.insert("cycle/#", {&typeid(int), make_slot(2), 2});
+    EXPECT_FALSE(trie.empty());
+
+    std::vector<ITopicSlot*> matched;
+    trie.match("cycle/x/y", typeid(int), matched);
+    EXPECT_EQ(matched.size(), 1u);
+}
+
 // ---------- Wildcard Validation Tests ----------
 
 TEST_F(MessageBusTest, InvalidWildcardHashNotLast) {

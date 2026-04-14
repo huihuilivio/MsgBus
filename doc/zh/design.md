@@ -314,23 +314,39 @@ bool isWildcard(std::string_view pattern);
 
 ---
 
-### 4.7 WildcardTrie — 通配符 Trie 索引
+### 4.7 WildcardTrie — 通配符 Trie 索引（RCU）
 
 **文件**: `include/msgbus/wildcard_trie.h`
 
 将通配符订阅 pattern 按 topic 层级建立 Trie 树，dispatch 时沿 concrete topic 的层级遍历 Trie，复杂度为 **O(topic 层级深度)** 而非 O(N)。
 
+内部采用 **RCU（Read-Copy-Update）** 策略实现线程安全：
+
 ```cpp
 class WildcardTrie {
 public:
-    void insert(std::string_view pattern,  // 插入通配符 pattern
+    void insert(std::string_view pattern,  // 插入通配符 pattern（RCU 写）
                const Entry& entry);
-    bool remove(SubscriptionId id);        // 按 ID 移除（自动修剪空节点）
-    void match(std::string_view topic,     // 查找匹配的 slot
+    bool remove(SubscriptionId id);        // 按 ID 移除（RCU 写，自动修剪空节点）
+    void match(std::string_view topic,     // 查找匹配的 slot（RCU 读）
                const std::type_info& type,
                std::vector<ITopicSlot*>& out) const;
-    bool empty() const;                    // O(1) entry 计数器
+    bool empty() const;                    // RCU 读，O(1)
 };
+```
+
+**RCU 机制**：
+
+```
+读路径（match / empty）:
+  1. atomic load 获取 shared_ptr<const Snapshot>（无锁）
+  2. 在不可变快照上遍历 Trie（无锁）
+
+写路径（insert / remove）:
+  1. write_mutex_ 序列化写操作
+  2. 深拷贝当前快照 → 修改副本
+  3. atomic store 发布新快照
+  4. 旧快照通过 shared_ptr 引用计数自动回收（grace period）
 ```
 
 **匹配算法**：
@@ -349,8 +365,9 @@ matchNode(node, levels, depth):
 |------|------|
 | 复杂度 | O(topic depth)，与 pattern 数量无关 |
 | 扩展性 | 100 个 pattern vs 1000 个 pattern QPS 相同（~1.6M） |
-| 线程安全 | 外部 shared_mutex 保护（读写分离） |
-| 内存 | `unordered_map<string, unique_ptr<Node>>` 树结构，移除后自动修剪空节点 |
+| 线程安全 | **内部 RCU**：读路径 `atomic<shared_ptr>` load（无锁），遍历完全无锁 |
+| 写操作 | write_mutex_ 序列化 + 深拷贝 COW，与 TopicSlot COW 风格一致 |
+| 内存 | `shared_ptr<const Snapshot>` 不可变快照，旧快照自动回收 |
 | 查找零分配 | 透明哈希（`SVHash`/`SVEqual`），`find(string_view)` 不构造临时 `std::string` |
 | `empty()` | O(1) `entry_count_` 计数器，非递归遍历 |
 
@@ -512,10 +529,10 @@ co_await bus.async_wait<T>(topic)
 |------|--------|------|
 | `publish` | shared_lock | TopicRegistry resolve + 对象池 acquire + 原子 CAS 入队 |
 | `subscribe` (精确) | mutex (COW) | 低频操作，复制整个列表 |
-| `subscribe` (通配符) | shared_mutex 写锁 | 追加 WildcardEntry |
-| `unsubscribe` | mutex / shared_mutex | 同上 |
+| `subscribe` (通配符) | mutex（RCU 写） | COW 深拷贝 + 原子发布新快照 |
+| `unsubscribe` | mutex / mutex（RCU 写） | 同上 |
 | `dispatch` (精确) | **读无锁** | TopicId 整数哈希查找，仅 shared_ptr 拷贝加锁，遍历无锁 |
-| `dispatch` (通配符) | shared_mutex 读锁 | Trie 遍历 O(depth)，不随模式数增长 |
+| `dispatch` (通配符) | **读无锁（RCU 读）** | `atomic<shared_ptr>` load + Trie 遍历 O(depth)，全程无锁 |
 | Topic 查找 | shared_mutex 读锁 | TopicId 整数键哈希表查找，读多写少 |
 | TopicRegistry resolve | shared_lock / unique_lock | 已注册只需 shared_lock，首次注册 unique_lock |
 | Router 路由 | **完全无锁** | hash(TopicId) + CAS 入 worker 队列 |
@@ -544,7 +561,7 @@ co_await bus.async_wait<T>(topic)
 | 路径 | 复杂度 | 锁 | 优化 |
 |------|--------|----|------|
 | publish → registry resolve → pool acquire → enqueue | O(1) | shared_lock + 无锁 | TopicId 整数赋值 + 对象池避免堆分配 |
-| dequeue → dispatch | O(subscribers + wildcards) | 读无锁/读锁 | TopicId 整数哈希 + COW 快照 |
+| dequeue → dispatch | O(subscribers + wildcards) | 读无锁 / RCU 读 | TopicId 整数哈希 + COW 快照 + RCU 快照 |
 | subscribe | O(n) copy | mutex | 低频，COW |
 
 ### 缓存友好
@@ -560,6 +577,7 @@ co_await bus.async_wait<T>(topic)
 * recycler 函数指针：零虚函数开销的回收路径
 * TopicId 整数路由：dispatch/route 路径上用 `uint32_t` 替代 `std::string` 哈希/比较
 * 通配符 Trie 索引：O(topic depth) 匹配替代 O(N) 线性扫描
+* WildcardTrie RCU：读路径仅拷贝 shared_ptr，遍历完全无锁，消除多 dispatcher 读锁竞争
 * 条件变量退避：替代 sleep，空闲时被 publish notify 快速唤醒
 
 ---
@@ -573,6 +591,7 @@ co_await bus.async_wait<T>(topic)
 | ~~Topic 通配符~~ | ~~P3~~ | ✅ 已实现 | MQTT 风格 `*` / `#` |
 | ~~TopicId 整数路由~~ | ~~P2~~ | ✅ 已实现 | TopicRegistry + uint32_t 替代 string，多 Topic +86% |
 | ~~通配符 Trie 索引~~ | ~~P2~~ | ✅ 已实现 | O(depth) 匹配，不随 pattern 数增长 |
+| ~~WildcardTrie RCU~~ | ~~P2~~ | ✅ 已实现 | 读路径近似无锁，消除 shared_mutex 读锁竞争 |
 | ~~条件变量退避~~ | ~~P2~~ | ✅ 已实现 | 替代 sleep，p50 延迟 ~7x |
 | Backpressure | P2 | 待实现 | publish 返回 false 时限流策略 |
 | Batch 消费 | P2 | 待实现 | 一次 dequeue 多条，减少调度开销 |
@@ -610,11 +629,13 @@ co_await bus.async_wait<T>(topic)
 - [x] 实现 WildcardTrie（按 topic 层级建立 Trie 树）
 - [x] 匹配复杂度 O(depth)，与模式数量无关
 - [x] 替代 wildcard_entries_ 线性扫描
-- [x] WildcardTrie 单元测试（12 个用例）
+- [x] WildcardTrie 单元测试（12 个用例 + 3 个 RCU 用例）
 - [x] 透明哈希（`SVHash`/`SVEqual`）实现 `find(string_view)` 零分配
 - [x] O(1) `entry_count_` 替代递归 `isEmpty()` 遍历
 - [x] `remove()` 后自动修剪空 Trie 节点（防内存泄漏）
 - [x] `insert()` 接受 `string_view pattern` 参数，Entry 不存储冗余 pattern 字符串
+- [x] RCU 改造：读路径拷贝不可变快照后无锁遍历，写路径 COW 深拷贝 + 原子发布
+- [x] 移除 MessageBus 中的外部 `wildcards_mutex_`，trie 内部自治
 
 ### 条件变量退避
 - [x] dispatch/router/worker 线程用 condition_variable 替代 sleep
@@ -661,7 +682,7 @@ co_await bus.async_wait<T>(topic)
 ### 工程化
 - [x] 单元测试（80 个 GTest 用例）
 - [x] 代码覆盖率统计（OpenCppCoverage / lcov，98.2%）
-- [x] 性能压测（8 个基准场景）
+- [x] 性能压测（10 个基准场景）
 - [x] GitHub Actions CI（Windows/Linux/macOS，UT 门禁）
 - [x] Release 工作流（tag 预发布 + 压测 + 源码包）
 - [x] 文档完善（设计文档 + 使用文档 + 性能文档）

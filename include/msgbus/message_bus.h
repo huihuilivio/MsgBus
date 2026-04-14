@@ -157,7 +157,6 @@ public:
             slot->addSubscriber(
                 std::function<void(const T&)>(std::forward<Handler>(handler)), id);
 
-            std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
             wildcard_trie_.insert(topic, {&typeid(T), slot, id});
 
             std::lock_guard<std::mutex> lk(sub_map_mutex_);
@@ -186,7 +185,6 @@ public:
         }
 
         if (info.is_wildcard) {
-            std::unique_lock<std::shared_mutex> lock(wildcards_mutex_);
             wildcard_trie_.remove(id);
         } else {
             ITopicSlot* slot = nullptr;
@@ -309,17 +307,16 @@ private:
             }
         }
 
-        // 2. Wildcard-match dispatch via trie (O(topic depth) instead of O(N))
+        // 2. Wildcard-match dispatch via trie (RCU: no external lock needed)
+        //    match() internally short-circuits when entry_count == 0,
+        //    so no separate empty() check needed (avoids double snapshot load).
         {
-            std::shared_lock<std::shared_mutex> lock(wildcards_mutex_);
-            if (!wildcard_trie_.empty()) {
-                std::string_view topic_sv = registry_.to_string(tid);
-                thread_local std::vector<ITopicSlot*> matched;
-                matched.clear();
-                wildcard_trie_.match(topic_sv, msg->type(), matched);
-                for (auto* slot : matched) {
-                    slot->dispatch(msg);
-                }
+            std::string_view topic_sv = registry_.to_string(tid);
+            thread_local std::vector<ITopicSlot*> matched;
+            matched.clear();
+            wildcard_trie_.match(topic_sv, msg->type(), matched);
+            for (auto* slot : matched) {
+                slot->dispatch(msg);
             }
         }
     }
@@ -449,8 +446,7 @@ private:
     std::unordered_map<TopicId, std::unique_ptr<ITopicSlot>> slots_;
     std::unordered_map<TopicId, const std::type_info*> topic_types_;
 
-    // Wildcard subscriptions (trie-indexed)
-    std::shared_mutex wildcards_mutex_;
+    // Wildcard subscriptions (trie-indexed, internally RCU-synchronized)
     WildcardTrie wildcard_trie_;
 
     struct SubInfo {
