@@ -1,5 +1,6 @@
 #pragma once
 
+#include "msgbus/config.h"
 #include "msgbus/subscriber.h"
 #include "msgbus/topic_slot.h"
 
@@ -120,15 +121,6 @@ private:
 
     // --- RCU machinery ---
 
-    // Feature detection: std::atomic<std::shared_ptr<T>> requires C++20 library
-    // support (__cpp_lib_atomic_shared_ptr). Available on MSVC 19.28+, GCC 12+,
-    // libstdc++ 12+. NOT available on Apple Clang / libc++ as of Xcode 16.
-#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
-#define MSGBUS_HAS_ATOMIC_SHARED_PTR 1
-#else
-#define MSGBUS_HAS_ATOMIC_SHARED_PTR 0
-#endif
-
     /// Load the current immutable snapshot.
     std::shared_ptr<const Snapshot> loadSnapshot() const {
 #if MSGBUS_HAS_ATOMIC_SHARED_PTR
@@ -236,7 +228,7 @@ private:
         for (auto it = node->children.begin(); it != node->children.end(); ++it) {
             if (removeFrom(it->second.get(), id)) {
                 if (it->second->entries.empty() && it->second->children.empty()) {
-                    node->children.erase(it);
+                    it = node->children.erase(it); // safe: returns next iterator
                 }
                 return true;
             }
@@ -251,8 +243,6 @@ private:
     std::shared_ptr<const Snapshot> snapshot_;
 #endif
     std::mutex write_mutex_;                                  // serializes COW writes
-
-#undef MSGBUS_HAS_ATOMIC_SHARED_PTR
 };
 
 } // namespace msgbus
