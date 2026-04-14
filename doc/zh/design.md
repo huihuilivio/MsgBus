@@ -89,6 +89,7 @@ MsgBus/
 ├── .gitignore
 ├── include/
 │   └── msgbus/
+│       ├── config.h                   # 特性检测 + 可调常量
 │       ├── lock_free_queue.h           # MPMC 无锁环形队列
 │       ├── message.h                   # IMessage 侵入式引用计数 + TypedMessage<T> + MessagePtr
 │       ├── object_pool.h              # 无锁对象池（freelist 回收）
@@ -105,8 +106,8 @@ MsgBus/
 │   └── wildcard_example.cpp           # 通配符订阅示例
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # 单元测试（80 个 GTest 用例）
-│   └── bench_message_bus.cpp           # 性能压测（8 个基准场景）
+│   ├── test_message_bus.cpp            # 单元测试（98 个 GTest 用例）
+│   └── bench_message_bus.cpp           # 性能压测（14+ 个基准场景）
 └── .github/
     └── workflows/
         ├── ci.yml                      # CI: UT on push/PR (Windows/Linux/macOS)
@@ -419,7 +420,12 @@ class MessageBus {
 public:
     /// @param queue_capacity  主队列容量（默认 kDefaultQueueCapacity = 65536）
     /// @param num_dispatchers dispatcher 线程数（默认 1，0 = 自动 = hardware_concurrency）
-    explicit MessageBus(size_t queue_capacity = kDefaultQueueCapacity, unsigned num_dispatchers = 1);
+    /// @param policy          队列满策略（默认 ReturnFalse）
+    /// @param publish_timeout BlockTimeout 策略超时时间（默认 100ms）
+    explicit MessageBus(size_t queue_capacity = kDefaultQueueCapacity,
+                        unsigned num_dispatchers = 1,
+                        FullPolicy policy = FullPolicy::ReturnFalse,
+                        std::chrono::milliseconds publish_timeout = std::chrono::milliseconds{100});
 
     void start();   // 启动 dispatcher 线程
     void stop();    // 停止并排空队列
@@ -435,7 +441,11 @@ public:
     template <typename T>
     AsyncWaitAwaitable<T> async_wait(std::string_view topic); // 协程等待
 
+    template <typename T>
+    TopicHandle<T> topic(std::string_view topic); // 缓存发布句柄
+
     unsigned dispatcher_count() const;  // 返回 dispatcher 线程数
+    FullPolicy policy() const;          // 返回当前队列满策略
 };
 ```
 
@@ -443,13 +453,32 @@ public:
 
 * 每个 topic 绑定首次 subscribe/publish 的类型 `T`
 * 类型不匹配时抛出 `std::runtime_error`
-* 使用 `std::shared_mutex` 实现读写分离：getOrCreateSlot 读多写少
+* `type_info` 指针嵌入 `ITopicSlot`，在 dispatch 时校验
+
+**队列满策略（FullPolicy）**：
+
+| 策略 | `publish()` 返回 | 行为 |
+|------|-----------------|------|
+| `ReturnFalse` | 满时 `false` | 默认，零开销 |
+| `DropOldest` | 始终 `true` | 淘汰最旧消息，由 `publish_mutex_` 串行化 |
+| `DropNewest` | 始终 `true` | 静默丢弃新消息 |
+| `Block` | 始终 `true` | 阻塞等待 `cv_not_full_`，dispatcher 排空后唤醒 |
+| `BlockTimeout` | 超时返回 `false` | 同 Block 但带截止时间 |
+
+**TopicHandle — 缓存发布**：
+
+```cpp
+auto handle = bus.topic<int>("sensor/temp");
+handle.publish(42);  // 跳过 registry resolve + topic 字符串哈希
+```
+
+创建时缓存 `TopicId` 和 `string_view`，消除每次 publish 的注册表查找开销。
 
 **消息分发（dispatchMessage）**：
 
 ```
-1. 精确匹配: slots_[topic_id] → TopicSlot<T>::dispatch()（整数哈希查找）
-2. 通配符匹配: registry_.to_string(topic_id) → WildcardTrie::match()
+1. 精确匹配: slots_[topic_id] → TopicSlot<T>::dispatch()（RCU 快照，零锁读取）
+2. 通配符匹配: msg->topic_sv() → WildcardTrie::match()
    → O(topic depth) 遍历 Trie，返回匹配的 slot 列表
 ```
 
@@ -530,12 +559,13 @@ co_await bus.async_wait<T>(topic)
 | 操作 | 锁级别 | 说明 |
 |------|--------|------|
 | `publish` | shared_lock | TopicRegistry resolve + 对象池 acquire + 原子 CAS 入队 |
+| `publish`（TopicHandle） | **无锁** | 跳过 registry resolve，仅对象池 acquire + CAS 入队 |
 | `subscribe` (精确) | mutex (COW) | 低频操作，复制整个列表 |
 | `subscribe` (通配符) | mutex（RCU 写） | COW 深拷贝 + 原子发布新快照 |
 | `unsubscribe` | mutex / mutex（RCU 写） | 同上 |
-| `dispatch` (精确) | **读无锁** | TopicId 整数哈希查找，仅 shared_ptr 拷贝加锁，遍历无锁 |
+| `dispatch` (精确) | **读无锁（RCU）** | `atomic<shared_ptr>` load SlotMap 快照（MSVC/GCC）或极短 mutex fallback；遍历无锁 |
 | `dispatch` (通配符) | **读无锁 / 近似无锁（RCU 读）** | `atomic<shared_ptr>` load（MSVC/GCC）或极短 mutex（Apple Clang）+ Trie 遍历 O(depth) 无锁 |
-| Topic 查找 | shared_mutex 读锁 | TopicId 整数键哈希表查找，读多写少 |
+| Topic 查找 | **RCU 读（无锁 / 近似无锁）** | `atomic<shared_ptr>` load（MSVC/GCC）或极短 mutex（Apple Clang） |
 | TopicRegistry resolve | shared_lock / unique_lock | 已注册只需 shared_lock，首次注册 unique_lock |
 | Router 路由 | **完全无锁** | hash(TopicId) + CAS 入 worker 队列 |
 
@@ -595,7 +625,7 @@ co_await bus.async_wait<T>(topic)
 | ~~通配符 Trie 索引~~ | ~~P2~~ | ✅ 已实现 | O(depth) 匹配，不随 pattern 数增长 |
 | ~~WildcardTrie RCU~~ | ~~P2~~ | ✅ 已实现 | 读路径近似无锁，消除 shared_mutex 读锁竞争 |
 | ~~条件变量退避~~ | ~~P2~~ | ✅ 已实现 | 替代 sleep，p50 延迟 ~7x |
-| Backpressure | P2 | 待实现 | publish 返回 false 时限流策略 |
+| Backpressure | P2 | ✅ 已实现 | FullPolicy 枚举: ReturnFalse / DropOldest / DropNewest / Block / BlockTimeout |
 | Batch 消费 | P2 | 待实现 | 一次 dequeue 多条，减少调度开销 |
 | 优先级队列 | P3 | 待实现 | 消息优先级 |
 | 延迟消息 | P3 | 待实现 | 定时投递 |
@@ -672,6 +702,23 @@ co_await bus.async_wait<T>(topic)
 - [x] 实现 async_wait\<T\>
 - [x] 实现 coroutine resume（SharedState 安全管理）
 
+### Backpressure（FullPolicy）
+- [x] FullPolicy 枚举: ReturnFalse / DropOldest / DropNewest / Block / BlockTimeout
+- [x] DropOldest: `publish_mutex_` 串行化 + dequeue-oldest 重试
+- [x] Block / BlockTimeout: `cv_not_full_` 条件变量 wait/notify
+- [x] 构造函数接受 `FullPolicy` 和 `publish_timeout` 参数
+
+### TopicHandle（缓存发布）
+- [x] `TopicHandle<T>` 内部类缓存 TopicId + topic string_view
+- [x] `bus.topic<T>(topic)` 创建句柄
+- [x] `handle.publish(msg)` 跳过 registry resolve
+
+### RCU Slot Map
+- [x] `slots_` 从 `shared_mutex` 改为 RCU（`atomic<shared_ptr<const SlotMap>>` 或 mutex fallback）
+- [x] Dispatch 读路径完全无锁（MSVC/GCC）或极短 mutex（Apple Clang）
+- [x] COW 写操作由 `slots_write_mutex_` 串行化
+- [x] `topic_sv_` 缓存在 IMessage 中，通配符 dispatch 避免 registry 反查
+
 ### 可靠性
 - [x] 异常隔离（handler 崩溃保护）
 - [x] async_wait 协程防双发（atomic fired guard）
@@ -682,9 +729,9 @@ co_await bus.async_wait<T>(topic)
 - [ ] metrics（队列长度、延迟）
 
 ### 工程化
-- [x] 单元测试（80 个 GTest 用例）
-- [x] 代码覆盖率统计（OpenCppCoverage / lcov，98.2%）
-- [x] 性能压测（10 个基准场景）
+- [x] 单元测试（98 个 GTest 用例）
+- [x] 代码覆盖率统计（OpenCppCoverage / lcov，98.7%）
+- [x] 性能压测（14+ 个基准场景）
 - [x] GitHub Actions CI（Windows/Linux/macOS，UT 门禁）
 - [x] Release 工作流（tag 预发布 + 压测 + 源码包）
 - [x] 文档完善（设计文档 + 使用文档 + 性能文档）
@@ -695,5 +742,4 @@ co_await bus.async_wait<T>(topic)
 - [ ] 支持优先级队列
 - [ ] 支持延迟消息
 - [ ] 支持跨进程通信（IPC）
-- [ ] Backpressure 限流策略
 - [ ] Batch 消费优化

@@ -86,7 +86,7 @@ target_link_libraries(your_target PRIVATE msgbus)
 ### 创建与启停
 
 ```cpp
-// 创建总线（默认：队列容量 65536，单 dispatcher）
+// 创建总线（默认：队列容量 65536，单 dispatcher，ReturnFalse 策略）
 msgbus::MessageBus bus;
 
 // 自定义队列容量
@@ -98,18 +98,72 @@ msgbus::MessageBus bus(65536, 4);
 // 自动检测 CPU 核心数
 msgbus::MessageBus bus(65536, 0);  // 0 = hardware_concurrency
 
+// 指定背压策略（见下方 FullPolicy 说明）
+msgbus::MessageBus bus(65536, 1, msgbus::FullPolicy::Block);
+
+// BlockTimeout + 自定义超时
+msgbus::MessageBus bus(65536, 1, msgbus::FullPolicy::BlockTimeout,
+                       std::chrono::milliseconds{500});
+
 bus.start();  // 启动 dispatcher 线程
 bus.stop();   // 停止并排空队列（析构时自动调用）
+```
+
+### 背压策略（FullPolicy）
+
+控制队列满时 `publish()` 的行为：
+
+```cpp
+enum class FullPolicy {
+    ReturnFalse,   // 立即返回 false（默认，零开销）
+    DropOldest,    // 丢弃最旧消息，始终成功
+    DropNewest,    // 静默丢弃新消息，始终返回 true
+    Block,         // 阻塞直到有空间（或 bus 停止）
+    BlockTimeout,  // 阻塞至超时，超时返回 false
+};
+```
+
+| 策略 | `publish()` 返回值 | 行为 |
+|------|-------------------|------|
+| `ReturnFalse` | 满时返回 `false` | 调用者决定重试或丢弃 |
+| `DropOldest` | 始终 `true` | 淘汰队列中最旧的消息 |
+| `DropNewest` | 始终 `true` | 静默丢弃新消息 |
+| `Block` | 始终 `true` | 阻塞调用者直到有空间 |
+| `BlockTimeout` | 超时返回 `false` | 阻塞至配置的超时时间 |
+
+```cpp
+// 示例：带 500ms 超时的阻塞发布
+msgbus::MessageBus bus(1024, 1, msgbus::FullPolicy::BlockTimeout,
+                       std::chrono::milliseconds{500});
+bus.start();
+if (!bus.publish<int>("topic", 42)) {
+    // 超时 — 队列满了 500ms
+}
 ```
 
 ### 发布消息
 
 ```cpp
-// 发布任意类型消息到 topic，返回 false 表示队列已满
+// 发布任意类型消息到 topic
+// 返回值取决于 FullPolicy（见上方背压策略说明）
 // 内部自动使用对象池复用消息对象
 bool ok = bus.publish<int>("sensor/count", 42);
 bus.publish<std::string>("log/info", "system started");
 bus.publish<MyStruct>("data/update", {1, 3.14, "hello"});
+```
+
+### TopicHandle（缓存发布）
+
+对同一 topic 高频发布时，使用 `TopicHandle` 跳过每次调用的 topic 字符串解析：
+
+```cpp
+// 创建缓存句柄（仅解析一次 topic 字符串）
+auto handle = bus.topic<int>("sensor/temp");
+
+// 后续发布跳过 registry 查找 — 更快的热路径
+handle.publish(42);
+handle.publish(50);
+handle.publish(99);
 ```
 
 ### 订阅消息（精确匹配）
@@ -290,14 +344,15 @@ int main() {
 ## 注意事项
 
 1. **类型安全**：同一 topic 只允许一种消息类型。对已有 topic 使用不同类型会抛出 `std::runtime_error`。
-2. **队列满**：`publish()` 在队列满时返回 `false`，调用者需重试或丢弃。
+2. **队列满**：`publish()` 在队列满时的行为取决于 `FullPolicy`（默认 `ReturnFalse` 返回 `false`）。参见[背压策略](#背压策略fullpolicy)。
 3. **Handler 线程**：单 dispatcher 模式下所有 handler 在一个线程中执行；多 dispatcher 模式下 handler 在 worker 线程中执行（同 topic 同 worker）。handler 应尽量轻量，避免阻塞。
 4. **Handler 异常**：单个 handler 抛异常不会影响其他订阅者，异常被静默捕获。
 5. **消息顺序**：同一 topic 的消息按 publish 顺序投递（单 dispatcher 直接保证；多 dispatcher 通过 hash 分片到同一 worker 保证）。
-6. **协程安全**：`async_wait` 是一次性等待，收到一条消息后自动取消订阅。内置 `atomic<bool>` 防护多 dispatcher 下的双发 race。
-7. **生命周期**：确保 `MessageBus` 的生命周期长于所有订阅者和协程。
+6. **协程安全**：`async_wait` 是一次性等待，收到一条消息后自动取消订阅。内置 `atomic<bool>` 防护多 dispatcher 下的双发 race。确保 `MessageBus` 的生命周期长于所有挂起的协程。
+7. **生命周期**：确保 `MessageBus` 的生命周期长于所有订阅者和协程。在协程挂起期间销毁 bus 会导致未定义行为。
 8. **通配符规则**：`*` 匹配恰好一层，`#` 匹配零层或多层且必须为 pattern 最后一段。
 9. **通配符 handler 线程安全**：多 dispatcher 模式下，通配符匹配的不同 topic 可能在不同 worker 线程中并发调用同一 handler，用户需保证通配符 handler 的线程安全性。
+10. **平台说明**：在支持 `std::atomic<std::shared_ptr>` 的平台（MSVC 19.28+、GCC 12+）上，dispatch 读路径完全无锁。在 Apple Clang / libc++ 上使用简短 mutex 回退（极短临界区，影响极小）。
 
 ## 构建选项
 
