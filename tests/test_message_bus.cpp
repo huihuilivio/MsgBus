@@ -538,6 +538,295 @@ TEST_F(MessageBusTest, QueueFullReturnsFalse) {
     small_bus.stop();
 }
 
+// ---------- FullPolicy Tests ----------
+
+TEST(FullPolicyTest, ReturnFalseDefault) {
+    // Default policy is ReturnFalse
+    MessageBus bus(4);
+    EXPECT_EQ(bus.policy(), FullPolicy::ReturnFalse);
+    // Do NOT start — queue will fill
+    int published = 0;
+    for (int i = 0; i < 100; ++i) {
+        if (!bus.publish<int>("full", i)) break;
+        ++published;
+    }
+    EXPECT_LT(published, 100);
+}
+
+TEST(FullPolicyTest, DropNewestAlwaysReturnsTrue) {
+    MessageBus bus(4, 1, FullPolicy::DropNewest);
+    EXPECT_EQ(bus.policy(), FullPolicy::DropNewest);
+    // Do NOT start — queue will fill, but publish always returns true
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_TRUE(bus.publish<int>("drop_newest", i));
+    }
+}
+
+TEST(FullPolicyTest, DropOldestAlwaysReturnsTrue) {
+    MessageBus bus(4, 1, FullPolicy::DropOldest);
+    EXPECT_EQ(bus.policy(), FullPolicy::DropOldest);
+    // Do NOT start — queue will fill, but publish always returns true
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_TRUE(bus.publish<int>("drop_oldest", i));
+    }
+}
+
+TEST(FullPolicyTest, DropOldestKeepsNewest) {
+    MessageBus bus(4, 1, FullPolicy::DropOldest);
+    bus.start();
+
+    std::vector<int> received;
+    std::mutex mu;
+    std::condition_variable done_cv;
+
+    bus.subscribe<int>("topic", [&](const int& v) {
+        std::lock_guard<std::mutex> lk(mu);
+        received.push_back(v);
+    });
+
+    // Overflow: publish 20 messages into capacity-4 queue without giving
+    // dispatcher much time. Newest messages should survive.
+    for (int i = 0; i < 20; ++i) {
+        bus.publish<int>("topic", i);
+    }
+
+    // Wait for dispatcher to drain
+    for (int i = 0; i < 200; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::lock_guard<std::mutex> lk(mu);
+        if (received.size() >= 4) break;
+    }
+    bus.stop();
+
+    std::lock_guard<std::mutex> lk(mu);
+    // Should have received some messages, and the last ones should be the newest
+    EXPECT_GE(received.size(), 1u);
+    if (!received.empty()) {
+        // The very last received should be close to 19 (the newest published)
+        EXPECT_GE(received.back(), 16); // at least among last 4
+    }
+}
+
+TEST(FullPolicyTest, BlockReleasesOnDequeue) {
+    MessageBus bus(4, 1, FullPolicy::Block);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("block", [&](const int&) {
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    // Publish more than capacity — Block policy should let all through
+    constexpr int N = 50;
+    std::thread publisher([&] {
+        for (int i = 0; i < N; ++i) {
+            EXPECT_TRUE(bus.publish<int>("block", i));
+        }
+    });
+
+    publisher.join();
+    // Wait for all to be consumed
+    for (int i = 0; i < 200 && received.load() < N; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    bus.stop();
+    EXPECT_EQ(received.load(), N);
+}
+
+TEST(FullPolicyTest, BlockTimeoutReturnsOnTimeout) {
+    MessageBus bus(4, 1, FullPolicy::BlockTimeout, std::chrono::milliseconds{50});
+    // Do NOT start — queue will fill and timeout
+    int succeeded = 0;
+    for (int i = 0; i < 20; ++i) {
+        if (bus.publish<int>("timeout", i)) ++succeeded;
+    }
+    // First few fit, rest should timeout and return false
+    EXPECT_GT(succeeded, 0);
+    EXPECT_LT(succeeded, 20);
+}
+
+TEST(FullPolicyTest, BlockWakesOnStop) {
+    MessageBus bus(4, 1, FullPolicy::Block);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("stop_wake", [&](const int&) {
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    // Publish enough to fill the queue + backlog, then from another thread
+    // publish one more that will block when the dispatcher is paused.
+    // We achieve this by subscribing a slow handler.
+    MessageBus slow_bus(4, 1, FullPolicy::Block);
+    slow_bus.start();
+    std::atomic<bool> handler_running{false};
+    std::atomic<bool> handler_release{false};
+    slow_bus.subscribe<int>("block_topic", [&](const int&) {
+        handler_running.store(true);
+        while (!handler_release.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    });
+
+    // Publish one message to trigger the slow handler (blocks dispatcher)
+    slow_bus.publish<int>("block_topic", 0);
+    while (!handler_running.load()) std::this_thread::yield();
+
+    // Now dispatcher is stuck. Fill the queue.
+    for (int i = 0; i < 4; ++i) {
+        slow_bus.publish<int>("block_topic", i + 1);
+    }
+
+    // Next publish should block (queue full, dispatcher stuck)
+    std::atomic<bool> publish_done{false};
+    std::thread publisher([&] {
+        slow_bus.publish<int>("block_topic", 999);
+        publish_done.store(true);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(publish_done.load());
+
+    // stop() should wake the blocked publisher
+    handler_release.store(true, std::memory_order_release);
+    slow_bus.stop();
+    publisher.join();
+    EXPECT_TRUE(publish_done.load());
+}
+
+TEST(FullPolicyTest, DropOldestMultiProducer) {
+    // Multiple producers with DropOldest — no crash, no UB
+    MessageBus bus(64, 1, FullPolicy::DropOldest);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("mp", [&](const int&) {
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    constexpr int THREADS = 4;
+    constexpr int PER_THREAD = 500;
+    std::vector<std::thread> producers;
+    for (int t = 0; t < THREADS; ++t) {
+        producers.emplace_back([&, t] {
+            for (int i = 0; i < PER_THREAD; ++i) {
+                bus.publish<int>("mp", t * PER_THREAD + i);
+            }
+        });
+    }
+    for (auto& th : producers) th.join();
+
+    // Wait for drain
+    for (int i = 0; i < 200 && received.load() < PER_THREAD; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    bus.stop();
+
+    EXPECT_GT(received.load(), 0);
+}
+
+TEST(FullPolicyTest, DropOldestRetryLoop) {
+    // Tiny queue + slow handler → forces the while-retry path in DropOldest.
+    // Use capacity=2 (minimum) so queue is almost always full.
+    MessageBus bus(2, 1, FullPolicy::DropOldest);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("retry", [&](const int&) {
+        // Slow handler to keep queue full
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    // Multi-threaded rapid-fire to maximize contention on publish_mutex_
+    constexpr int THREADS = 4;
+    constexpr int PER_THREAD = 50;
+    std::vector<std::thread> producers;
+    for (int t = 0; t < THREADS; ++t) {
+        producers.emplace_back([&] {
+            for (int i = 0; i < PER_THREAD; ++i) {
+                bus.publish<int>("retry", i);
+            }
+        });
+    }
+    for (auto& th : producers) th.join();
+
+    bus.stop();
+    EXPECT_GT(received.load(), 0);
+}
+
+TEST(FullPolicyTest, BlockWaitsAndDrains) {
+    // Block policy: tiny queue + slow handler → publisher blocks in cv_wait,
+    // then woken when dispatcher drains. Exercises the cv_not_full_.wait() lambda.
+    MessageBus bus(2, 1, FullPolicy::Block);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("block_drain", [&](const int&) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    // Publish from multiple threads to increase contention
+    constexpr int N = 30;
+    std::vector<std::thread> publishers;
+    for (int t = 0; t < 3; ++t) {
+        publishers.emplace_back([&, t] {
+            for (int i = 0; i < N / 3; ++i) {
+                EXPECT_TRUE(bus.publish<int>("block_drain", t * 10 + i));
+            }
+        });
+    }
+    for (auto& th : publishers) th.join();
+
+    bus.stop();
+    EXPECT_EQ(received.load(), N);
+}
+
+TEST(FullPolicyTest, BlockTimeoutWaitsAndDrains) {
+    // Exercises wait_until lambda: publisher must enter wait_until and be woken
+    // by notify_not_full when the dispatcher drains.
+    // Strategy: slow handler holds dispatcher, fill queue completely, then
+    // a publisher thread blocks. Release gate → handler finishes → space freed.
+    MessageBus bus(4, 1, FullPolicy::BlockTimeout, std::chrono::milliseconds{5000});
+    bus.start();
+
+    std::atomic<bool> handler_gate{false};
+    std::atomic<int> received{0};
+    bus.subscribe<int>("bt_drain", [&](const int&) {
+        // First call blocks until gate is released
+        if (received.load(std::memory_order_relaxed) == 0) {
+            while (!handler_gate.load(std::memory_order_acquire))
+                std::this_thread::yield();
+        }
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    // Publish enough to trigger the handler and fill the queue behind it.
+    // The first message enters the handler which blocks. The remaining
+    // messages saturate the queue (capacity=4).
+    for (int i = 0; i < 5; ++i) {
+        bus.publish<int>("bt_drain", i);
+    }
+    // Give dispatcher time to pick up the first message and block in handler
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Next publish should block in wait_until (queue full, handler gated)
+    std::atomic<bool> pub_done{false};
+    std::thread publisher([&] {
+        bus.publish<int>("bt_drain", 99);
+        pub_done.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Release gate → dispatcher drains → notify_not_full → publisher unblocks
+    handler_gate.store(true, std::memory_order_release);
+    publisher.join();
+    EXPECT_TRUE(pub_done.load());
+
+    bus.stop();
+    EXPECT_GT(received.load(), 0);
+}
+
 TEST_F(MessageBusTest, StartStopIdempotent) {
     // Already started in SetUp
     bus.start(); // second start should be no-op
@@ -614,6 +903,27 @@ struct Task {
     };
 };
 
+/// A coroutine Task that owns its handle, allowing manual destruction
+/// while the coroutine is suspended (to test cleanup paths).
+struct DestroyableTask {
+    struct promise_type {
+        DestroyableTask get_return_object() {
+            return DestroyableTask{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_void() {}
+        void unhandled_exception() { std::terminate(); }
+    };
+
+    std::coroutine_handle<promise_type> handle;
+
+    explicit DestroyableTask(std::coroutine_handle<promise_type> h) : handle(h) {}
+    DestroyableTask(DestroyableTask&& o) noexcept : handle(o.handle) { o.handle = nullptr; }
+    DestroyableTask& operator=(DestroyableTask&&) = delete;
+    ~DestroyableTask() { if (handle) handle.destroy(); }
+};
+
 TEST_F(MessageBusTest, CoroutineAsyncWait) {
     std::promise<int> promise;
     auto future = promise.get_future();
@@ -646,6 +956,56 @@ TEST_F(MessageBusTest, CoroutineAsyncWaitString) {
     ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
               std::future_status::ready);
     EXPECT_EQ(future.get(), "coroutine!");
+}
+
+TEST_F(MessageBusTest, CoroutineAwaitableDestroyedBeforeMessage) {
+    // Exercises the AsyncWaitAwaitable destructor cleanup path (L266):
+    // coroutine suspends on co_await, then gets destroyed before message arrives.
+    {
+        auto task = [&]() -> DestroyableTask {
+            co_await bus.async_wait<int>("coro/no_msg");
+            // Never reached — task destroyed while suspended
+        };
+        auto t = task(); // coroutine suspends at co_await
+        // t goes out of scope → handle.destroy() → awaitable destructor
+        // sees sub_id != 0 → unsubscribes
+    }
+    // Verify bus is still functional after cleanup
+    std::promise<int> p;
+    auto f = p.get_future();
+    bus.subscribe<int>("coro/after", [&](const int& v) { p.set_value(v); });
+    bus.publish<int>("coro/after", 42);
+    ASSERT_EQ(f.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_EQ(f.get(), 42);
+}
+
+TEST(CoroutineTest, AsyncWaitDuplicateFireGuard) {
+    // Exercises the CAS duplicate-fire guard (L248) by using a wildcard pattern
+    // with multi-dispatcher that may deliver to the same handler from multiple workers.
+    MessageBus bus(65536, 4);
+    bus.start();
+
+    std::atomic<int> fire_count{0};
+    std::promise<int> promise;
+    auto future = promise.get_future();
+
+    auto coro = [&]() -> Task {
+        auto val = co_await bus.async_wait<int>("dup/#");
+        fire_count.fetch_add(1, std::memory_order_relaxed);
+        promise.set_value(val);
+    };
+    coro();
+
+    // Publish to multiple topics matching the wildcard
+    for (int i = 0; i < 10; ++i) {
+        bus.publish<int>("dup/" + std::to_string(i), i);
+    }
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    // Only one fire should have occurred despite multiple matching publishes
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(fire_count.load(), 1);
+    bus.stop();
 }
 
 // ---------- Topic Matcher Tests ----------
@@ -1217,26 +1577,30 @@ TEST(TopicSlotTest, RemoveNonExistentSubscriber) {
 
 TEST_F(MessageBusTest, ConcurrentSubscribeSameTopic) {
     // Force getOrCreateSlot's write-lock path to find an existing slot
-    // (another thread created it between read-unlock and write-lock)
-    constexpr int THREADS = 8;
-    std::atomic<int> count{0};
-    std::vector<std::thread> threads;
-    std::vector<SubscriptionId> ids(THREADS);
+    // (another thread created it between read-unlock and write-lock).
+    // Use many threads + multiple rounds to maximize double-check-hit chance.
+    constexpr int THREADS = 16;
+    constexpr int ROUNDS = 5;
+    for (int r = 0; r < ROUNDS; ++r) {
+        std::string topic = "concurrent/sub/" + std::to_string(r);
+        std::atomic<int> count{0};
+        std::vector<std::thread> threads;
+        std::vector<SubscriptionId> ids(THREADS);
 
-    for (int t = 0; t < THREADS; ++t) {
-        threads.emplace_back([&, t] {
-            ids[t] = bus.subscribe<int>("concurrent/sub",
-                [&](const int&) { count.fetch_add(1); });
-        });
-    }
-    for (auto& th : threads) th.join();
+        for (int t = 0; t < THREADS; ++t) {
+            threads.emplace_back([&, t] {
+                ids[t] = bus.subscribe<int>(topic,
+                    [&](const int&) { count.fetch_add(1); });
+            });
+        }
+        for (auto& th : threads) th.join();
 
-    // All subscribers should receive a message
-    bus.publish<int>("concurrent/sub", 42);
-    for (int i = 0; i < 100 && count.load() < THREADS; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        bus.publish<int>(topic, 42);
+        for (int i = 0; i < 100 && count.load() < THREADS; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        EXPECT_EQ(count.load(), THREADS);
     }
-    EXPECT_EQ(count.load(), THREADS);
 }
 
 // ---------- Multi-dispatcher drain paths ----------
@@ -1278,14 +1642,68 @@ TEST_F(MultiDispatcherTest, RestartAfterStop) {
     EXPECT_EQ(future.get(), 55);
 }
 
+// Exercises routeToWorker + routerLoop drain: slow workers keep router
+// busy routing, then stop() triggers drain of remaining main-queue messages.
+TEST_F(MultiDispatcherTest, HighVolumeStopDrain) {
+    constexpr int NUM_TOPICS = 16;
+    constexpr int PER_TOPIC = 50;
+    std::atomic<int> received{0};
+    for (int t = 0; t < NUM_TOPICS; ++t) {
+        bus.subscribe<int>("drain/" + std::to_string(t), [&](const int&) {
+            received.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+
+    // Blast messages from multiple threads concurrently
+    std::vector<std::thread> producers;
+    for (int t = 0; t < NUM_TOPICS; ++t) {
+        producers.emplace_back([&, t] {
+            for (int i = 0; i < PER_TOPIC; ++i) {
+                while (!bus.publish<int>("drain/" + std::to_string(t), i))
+                    std::this_thread::yield();
+            }
+        });
+    }
+    for (auto& th : producers) th.join();
+
+    // stop() triggers routerLoop drain → routeToWorker → workerLoop drain
+    bus.stop();
+    EXPECT_EQ(received.load(), NUM_TOPICS * PER_TOPIC);
+}
+
+// Uses a slow handler so stop() finds un-routed messages in the main queue.
+TEST(MultiDispatcherDrainTest, RouterDrainWithPendingMessages) {
+    MessageBus bus(65536, 4);
+    bus.start();
+
+    std::atomic<int> received{0};
+    // Slow handler to keep workers busy → main queue accumulates
+    for (int t = 0; t < 8; ++t) {
+        bus.subscribe<int>("route/" + std::to_string(t), [&](const int&) {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            received.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+
+    // Blast enough messages fast so that main queue has leftover at stop()
+    for (int i = 0; i < 2000; ++i) {
+        bus.publish<int>("route/" + std::to_string(i % 8), i);
+    }
+
+    // Immediately stop — router drain path should execute
+    bus.stop();
+    // All published messages that entered the queue should be eventually delivered
+    EXPECT_GT(received.load(), 0);
+}
+
 // ---------- LockFreeQueue high-contention ----------
 
 TEST(LockFreeQueueTest, HighContentionMPMC) {
-    // Tiny queue + many threads → force CAS retry branches
-    LockFreeQueue<int> q(8);
+    // Tiny queue (capacity=4) + many threads → maximize CAS retry branches
+    LockFreeQueue<int> q(4);
     constexpr int PRODUCERS = 8;
     constexpr int CONSUMERS = 8;
-    constexpr int PER_PRODUCER = 500;
+    constexpr int PER_PRODUCER = 1000;
     constexpr int TOTAL = PRODUCERS * PER_PRODUCER;
 
     std::atomic<long long> sum{0};

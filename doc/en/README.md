@@ -86,7 +86,7 @@ target_link_libraries(your_target PRIVATE msgbus)
 ### Create & Lifecycle
 
 ```cpp
-// Default: queue capacity 65536, single dispatcher
+// Default: queue capacity 65536, single dispatcher, ReturnFalse policy
 msgbus::MessageBus bus;
 
 // Custom queue capacity
@@ -98,18 +98,72 @@ msgbus::MessageBus bus(65536, 4);
 // Auto-detect CPU cores
 msgbus::MessageBus bus(65536, 0);  // 0 = hardware_concurrency
 
+// With backpressure policy (see FullPolicy below)
+msgbus::MessageBus bus(65536, 1, msgbus::FullPolicy::Block);
+
+// BlockTimeout with custom timeout
+msgbus::MessageBus bus(65536, 1, msgbus::FullPolicy::BlockTimeout,
+                       std::chrono::milliseconds{500});
+
 bus.start();  // Start dispatcher thread(s)
 bus.stop();   // Stop and drain queue (called automatically on destruction)
+```
+
+### Backpressure Policy (FullPolicy)
+
+Controls `publish()` behavior when the internal queue is full:
+
+```cpp
+enum class FullPolicy {
+    ReturnFalse,   // Return false immediately (default, zero overhead)
+    DropOldest,    // Drop the oldest message; always succeeds
+    DropNewest,    // Drop the new message silently; always returns true
+    Block,         // Block until space is available (or bus stops)
+    BlockTimeout,  // Block up to a timeout, then return false
+};
+```
+
+| Policy | `publish()` returns | Behavior |
+|--------|-------------------|----------|
+| `ReturnFalse` | `false` if full | Caller decides retry or discard |
+| `DropOldest` | always `true` | Evicts oldest queued message |
+| `DropNewest` | always `true` | Silently drops the new message |
+| `Block` | always `true` | Blocks caller until space available |
+| `BlockTimeout` | `false` on timeout | Blocks up to the configured timeout |
+
+```cpp
+// Example: blocking publisher with 500ms timeout
+msgbus::MessageBus bus(1024, 1, msgbus::FullPolicy::BlockTimeout,
+                       std::chrono::milliseconds{500});
+bus.start();
+if (!bus.publish<int>("topic", 42)) {
+    // Timed out — queue was full for 500ms
+}
 ```
 
 ### Publish Messages
 
 ```cpp
-// Publish any type to a topic. Returns false if queue is full.
+// Publish any type to a topic.
+// Return value depends on FullPolicy (see Backpressure Policy above).
 // Internally uses object pool for message reuse.
 bool ok = bus.publish<int>("sensor/count", 42);
 bus.publish<std::string>("log/info", "system started");
 bus.publish<MyStruct>("data/update", {1, 3.14, "hello"});
+```
+
+### TopicHandle (Cached Publish)
+
+For high-frequency publishing to the same topic, use `TopicHandle` to skip topic string resolution on each call:
+
+```cpp
+// Create a cached handle (resolves topic string once)
+auto handle = bus.topic<int>("sensor/temp");
+
+// Subsequent publishes skip registry lookup — faster hot path
+handle.publish(42);
+handle.publish(50);
+handle.publish(99);
 ```
 
 ### Subscribe (Exact Match)
@@ -288,14 +342,15 @@ int main() {
 ## Important Notes
 
 1. **Type Safety**: Each topic allows only one message type. Using a different type on an existing topic throws `std::runtime_error`.
-2. **Queue Full**: `publish()` returns `false` when the queue is full; the caller should retry or discard.
+2. **Queue Full**: `publish()` behavior on queue full depends on `FullPolicy` (default: `ReturnFalse` returns `false`). See [Backpressure Policy](#backpressure-policy-fullpolicy).
 3. **Handler Threads**: In single-dispatcher mode, all handlers run in one thread; in multi-dispatcher mode, handlers run in worker threads (same topic → same worker). Keep handlers lightweight; avoid blocking.
 4. **Handler Exceptions**: A handler throwing an exception does not affect other subscribers; exceptions are silently caught.
 5. **Message Ordering**: Messages on the same topic are delivered in publish order (single-dispatcher: guaranteed directly; multi-dispatcher: guaranteed via hash sharding to the same worker).
-6. **Coroutine Safety**: `async_wait` is a one-shot wait that auto-unsubscribes after receiving one message. Built-in `atomic<bool>` guard prevents double-resume under multi-dispatcher.
-7. **Lifetime**: Ensure `MessageBus` outlives all subscribers and coroutines.
+6. **Coroutine Safety**: `async_wait` is a one-shot wait that auto-unsubscribes after receiving one message. Built-in `atomic<bool>` guard prevents double-resume under multi-dispatcher. Ensure `MessageBus` outlives all pending coroutines.
+7. **Lifetime**: Ensure `MessageBus` outlives all subscribers and coroutines. Destroying the bus while coroutines are suspended leads to undefined behavior.
 8. **Wildcard Rules**: `*` matches exactly one level, `#` matches zero or more trailing levels and must be the last segment.
 9. **Wildcard Handler Thread Safety**: In multi-dispatcher mode, different topics matching the same wildcard pattern may invoke the handler concurrently from different worker threads. Ensure your wildcard handlers are thread-safe.
+10. **Platform Note**: On platforms with `std::atomic<std::shared_ptr>` support (MSVC 19.28+, GCC 12+), the dispatch read path is fully lock-free. On Apple Clang / libc++, a brief mutex fallback is used (very short critical section, minimal impact).
 
 ## Build Options
 

@@ -89,6 +89,7 @@ MsgBus/
 ├── .gitignore
 ├── include/
 │   └── msgbus/
+│       ├── config.h                   # Feature detection + tuning constants
 │       ├── lock_free_queue.h           # MPMC lock-free ring buffer
 │       ├── message.h                   # IMessage intrusive ref count + TypedMessage<T> + MessagePtr
 │       ├── object_pool.h              # Lock-free object pool (freelist recycling)
@@ -105,8 +106,8 @@ MsgBus/
 │   └── wildcard_example.cpp           # Wildcard subscription example
 ├── tests/
 │   ├── CMakeLists.txt
-│   ├── test_message_bus.cpp            # Unit tests (80 GTest cases)
-│   └── bench_message_bus.cpp           # Benchmarks (8 scenarios)
+│   ├── test_message_bus.cpp            # Unit tests (98 GTest cases)
+│   └── bench_message_bus.cpp           # Benchmarks (14+ scenarios)
 └── .github/
     └── workflows/
         ├── ci.yml                      # CI: UT on push/PR (Windows/Linux/macOS)
@@ -419,7 +420,12 @@ class MessageBus {
 public:
     /// @param queue_capacity  Main queue capacity (default kDefaultQueueCapacity = 65536)
     /// @param num_dispatchers Dispatcher thread count (default 1, 0 = auto = hardware_concurrency)
-    explicit MessageBus(size_t queue_capacity = kDefaultQueueCapacity, unsigned num_dispatchers = 1);
+    /// @param policy          Queue-full strategy (default ReturnFalse)
+    /// @param publish_timeout Timeout for BlockTimeout policy (default 100ms)
+    explicit MessageBus(size_t queue_capacity = kDefaultQueueCapacity,
+                        unsigned num_dispatchers = 1,
+                        FullPolicy policy = FullPolicy::ReturnFalse,
+                        std::chrono::milliseconds publish_timeout = std::chrono::milliseconds{100});
 
     void start();   // Start dispatcher thread(s)
     void stop();    // Stop and drain queue
@@ -435,7 +441,11 @@ public:
     template <typename T>
     AsyncWaitAwaitable<T> async_wait(std::string_view topic); // Coroutine await
 
+    template <typename T>
+    TopicHandle<T> topic(std::string_view topic); // Cached publish handle
+
     unsigned dispatcher_count() const;  // Returns dispatcher thread count
+    FullPolicy policy() const;          // Returns current full policy
 };
 ```
 
@@ -443,13 +453,32 @@ public:
 
 * Each topic binds to the type `T` of the first subscribe/publish call
 * Type mismatch throws `std::runtime_error`
-* Uses `std::shared_mutex` for read-write separation: getOrCreateSlot is read-heavy
+* `type_info` pointer embedded in `ITopicSlot`, checked at dispatch time
+
+**Queue-Full Policies (FullPolicy)**:
+
+| Policy | `publish()` | Behavior |
+|--------|------------|----------|
+| `ReturnFalse` | `false` if full | Default, zero overhead |
+| `DropOldest` | always `true` | Evicts oldest, serialized by `publish_mutex_` |
+| `DropNewest` | always `true` | Silently drops new message |
+| `Block` | always `true` | Waits on `cv_not_full_`, woken when dispatcher drains |
+| `BlockTimeout` | `false` on timeout | Same as Block with deadline |
+
+**TopicHandle — Cached Publish**:
+
+```cpp
+auto handle = bus.topic<int>("sensor/temp");
+handle.publish(42);  // Skips registry resolve + topic string hash
+```
+
+Caches `TopicId` and `string_view` at creation time, eliminating per-publish registry lookup.
 
 **Message Dispatch (dispatchMessage)**:
 
 ```
-1. Exact match: slots_[topic_id] → TopicSlot<T>::dispatch() (integer hash lookup)
-2. Wildcard match: registry_.to_string(topic_id) → WildcardTrie::match()
+1. Exact match: slots_[topic_id] → TopicSlot<T>::dispatch() (RCU snapshot, zero-lock read)
+2. Wildcard match: msg->topic_sv() → WildcardTrie::match()
    → O(topic depth) trie traversal, returns matching slot list
 ```
 
@@ -530,12 +559,13 @@ co_await bus.async_wait<T>(topic)
 | Operation | Lock Level | Notes |
 |---|---|---|
 | `publish` | shared_lock | TopicRegistry resolve + pool acquire + atomic CAS enqueue |
+| `publish` (TopicHandle) | **lock-free** | Skips registry resolve, pool acquire + CAS enqueue only |
 | `subscribe` (exact) | mutex (COW) | Low-frequency, copies entire list |
 | `subscribe` (wildcard) | mutex (RCU write) | COW deep-copy + atomic publish new snapshot |
 | `unsubscribe` | mutex / mutex (RCU write) | Same as above |
-| `dispatch` (exact) | **Read lock-free** | TopicId integer hash lookup; only shared_ptr copy under lock; iteration lock-free |
+| `dispatch` (exact) | **Read lock-free (RCU)** | `atomic<shared_ptr>` load of SlotMap snapshot (MSVC/GCC) or brief mutex fallback; iteration lock-free |
 | `dispatch` (wildcard) | **Read lock-free / near lock-free (RCU read)** | `atomic<shared_ptr>` load (MSVC/GCC) or brief mutex (Apple Clang) + trie traversal O(depth) lock-free |
-| Topic lookup | shared_mutex read lock | TopicId integer-key hash table lookup, read-heavy |
+| Topic lookup | **RCU read (lock-free / near lock-free)** | `atomic<shared_ptr>` load (MSVC/GCC) or brief mutex (Apple Clang) |
 | TopicRegistry resolve | shared_lock / unique_lock | Already registered: shared_lock only; first registration: unique_lock |
 | Router routing | **Fully lock-free** | hash(TopicId) + CAS into worker queue |
 
@@ -595,7 +625,7 @@ co_await bus.async_wait<T>(topic)
 | ~~Wildcard trie index~~ | ~~P2~~ | ✅ Done | O(depth) matching, independent of pattern count |
 | ~~WildcardTrie RCU~~ | ~~P2~~ | ✅ Done | Read path near lock-free, eliminates shared_mutex read contention |
 | ~~Condition variable backoff~~ | ~~P2~~ | ✅ Done | Replaces sleep, p50 latency ~7x |
-| Backpressure | P2 | Planned | Rate limiting strategy when publish returns false |
+| Backpressure | P2 | ✅ Done | FullPolicy enum: ReturnFalse / DropOldest / DropNewest / Block / BlockTimeout |
 | Batch consumption | P2 | Planned | Dequeue multiple at once, reduce scheduling overhead |
 | Priority queue | P3 | Planned | Message priorities |
 | Delayed messages | P3 | Planned | Timed delivery |
@@ -645,6 +675,23 @@ co_await bus.async_wait<T>(topic)
 - [x] routeToWorker notifies corresponding worker
 - [x] stop() wakes all threads via notify_all
 
+### Backpressure (FullPolicy)
+- [x] FullPolicy enum: ReturnFalse / DropOldest / DropNewest / Block / BlockTimeout
+- [x] DropOldest: `publish_mutex_` serialization + dequeue-oldest retry
+- [x] Block / BlockTimeout: `cv_not_full_` condition variable wait/notify
+- [x] Constructor accepts `FullPolicy` and `publish_timeout` parameters
+
+### TopicHandle (Cached Publish)
+- [x] `TopicHandle<T>` inner class caches TopicId + topic string_view
+- [x] `bus.topic<T>(topic)` creates handle
+- [x] `handle.publish(msg)` skips registry resolve
+
+### RCU Slot Map
+- [x] `slots_` changed from `shared_mutex` to RCU (`atomic<shared_ptr<const SlotMap>>` or mutex fallback)
+- [x] Dispatch read path fully lock-free (MSVC/GCC) or brief mutex (Apple Clang)
+- [x] COW writes serialized by `slots_write_mutex_`
+- [x] `topic_sv_` cache in IMessage avoids registry reverse lookup on wildcard dispatch
+
 ### Multi-Dispatcher
 - [x] Router thread (hash sharding)
 - [x] Worker thread pool (independent backoff)
@@ -682,9 +729,9 @@ co_await bus.async_wait<T>(topic)
 - [ ] Metrics (queue depth, latency)
 
 ### Engineering
-- [x] Unit tests (80 GTest cases)
-- [x] Code coverage (OpenCppCoverage / lcov, 98.2%)
-- [x] Benchmarks (10 scenarios)
+- [x] Unit tests (98 GTest cases)
+- [x] Code coverage (OpenCppCoverage / lcov, 98.7%)
+- [x] Benchmarks (14+ scenarios)
 - [x] GitHub Actions CI (Windows/Linux/macOS, UT gate)
 - [x] Release workflow (tag pre-release + benchmarks + source archive)
 - [x] Documentation (design doc + usage doc + benchmark doc)

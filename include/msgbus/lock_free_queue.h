@@ -12,7 +12,7 @@ template <typename T>
 class LockFreeQueue {
 public:
     explicit LockFreeQueue(size_t capacity)
-        : capacity_(roundUpPowerOf2(capacity))
+        : capacity_(roundUpPowerOf2(capacity < 2 ? 2 : capacity))
         , mask_(capacity_ - 1)
         , buffer_(new Cell[capacity_])
         , enqueue_pos_(0)

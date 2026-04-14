@@ -11,7 +11,11 @@ struct Event {
 };
 
 int main() {
-    msgbus::MessageBus bus;
+    // BlockTimeout policy: publish() blocks up to 100ms if queue is full,
+    // then returns false on timeout.
+    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 1,
+                           msgbus::FullPolicy::BlockTimeout,
+                           std::chrono::milliseconds{100});
     bus.start();
 
     // '*' matches exactly one level

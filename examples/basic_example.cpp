@@ -18,8 +18,15 @@ struct LogEvent {
 int main() {
     // Multi-dispatcher: 1 router thread + 4 worker threads (topic hash sharding).
     // Use 0 for auto (= hardware_concurrency).
-    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 4);
+    // FullPolicy::DropNewest — silently drop new messages when queue is full.
+    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 4,
+                           msgbus::FullPolicy::DropNewest);
     bus.start();
+
+    std::cout << "Policy: "
+              << (bus.policy() == msgbus::FullPolicy::DropNewest
+                      ? "DropNewest" : "Other")
+              << "\n\n";
 
     // --- Exact topic subscriptions ---
     auto sub1 = bus.subscribe<SensorData>("sensor/temperature",
@@ -50,10 +57,14 @@ int main() {
                       << event.message << "\n";
         });
 
+    // --- TopicHandle: cached publish for high-frequency topics ---
+    // Skips registry resolve + topic string hash on each publish.
+    auto temp_handle = bus.topic<SensorData>("sensor/temperature");
+
     // --- Publish messages to various topics ---
-    bus.publish<SensorData>("sensor/temperature", {1, 23.5});
+    temp_handle.publish({1, 23.5});                          // via TopicHandle
     bus.publish<SensorData>("sensor/humidity",    {2, 65.3});
-    bus.publish<SensorData>("sensor/temperature", {3, 67.8});
+    temp_handle.publish({3, 67.8});                          // via TopicHandle
     bus.publish<SensorData>("sensor/pressure",    {4, 1013.25});
     bus.publish<LogEvent>("system/log",           {"INFO", "System started"});
     bus.publish<LogEvent>("system/log/audit",     {"WARN", "Config changed"});
@@ -65,7 +76,7 @@ int main() {
     std::cout << "\n--- Unsubscribing wildcard sensor listener ---\n\n";
     bus.unsubscribe(sub_all_sensors);
 
-    bus.publish<SensorData>("sensor/temperature", {5, 55.0});
+    temp_handle.publish({5, 55.0});                          // via TopicHandle
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     bus.stop();

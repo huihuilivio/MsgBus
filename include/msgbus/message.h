@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string_view>
 #include <typeinfo>
 #include <utility>
 
@@ -20,6 +21,10 @@ struct IMessage {
     virtual TopicId topic_id() const = 0;
     virtual const std::type_info& type() const = 0;
 
+    /// Cached topic string (set during publish, valid for message lifetime).
+    std::string_view topic_sv() const noexcept { return topic_sv_; }
+    void set_topic_sv(std::string_view sv) noexcept { topic_sv_ = sv; }
+
     void add_ref() noexcept {
         ref_count_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -28,6 +33,9 @@ struct IMessage {
     bool release_ref() noexcept {
         return ref_count_.fetch_sub(1, std::memory_order_acq_rel) == 1;
     }
+
+private:
+    std::string_view topic_sv_;
 };
 
 template <typename T>
