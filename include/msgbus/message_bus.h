@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "msgbus/config.h"
 #include "msgbus/lock_free_queue.h"

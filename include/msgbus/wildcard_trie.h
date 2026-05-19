@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "msgbus/config.h"
 #include "msgbus/subscriber.h"
