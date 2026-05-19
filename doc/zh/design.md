@@ -184,11 +184,13 @@ inline constexpr TopicId kInvalidTopicId = 0;
 struct IMessage {
     std::atomic<int> ref_count_{0};         // 侵入式引用计数
     void (*recycler_)(IMessage*) = nullptr; // 回收函数指针
+    std::function<void(IMessage&)> on_drop_; // 丢弃回调（由带 on_drop 的 publish 设置）
 
     virtual TopicId topic_id();
     virtual const std::type_info& type();
     void add_ref() noexcept;
     bool release_ref() noexcept;            // 归零返回 true
+    void notify_drop();                     // 调用并清空 on_drop_ 回调
 };
 
 template <typename T>
@@ -433,6 +435,9 @@ public:
     template <typename T>
     bool publish(std::string_view topic, T msg);          // 发布（对象池 + 无锁入队）
 
+    template <typename T, typename OnDrop>
+    bool publish(std::string_view topic, T msg, OnDrop&& on_drop); // 带丢弃回调的发布
+
     template <typename T, typename Handler>
     SubscriptionId subscribe(std::string_view topic, Handler&& handler); // 支持通配符
 
@@ -464,6 +469,8 @@ public:
 | `DropNewest` | 始终 `true` | 静默丢弃新消息 |
 | `Block` | 始终 `true` | 阻塞等待 `cv_not_full_`，dispatcher 排空后唤醒 |
 | `BlockTimeout` | 超时返回 `false` | 同 Block 但带截止时间 |
+
+**丢弃回调**：使用 `DropOldest` 或 `DropNewest` 时，可以向 `publish()` 传入回调，签名 `(std::string_view topic, const T& data)`，当消息被丢弃时调用。回调存储在 `IMessage::on_drop_` 中，通过 `notify_drop()` 在丢弃时触发。这是逐消息回调 — 每次 publish 可以指定不同的回调。`TopicHandle::publish()` 不支持此功能，以保持热路径的极致性能。
 
 **TopicHandle — 缓存发布**：
 
@@ -707,6 +714,7 @@ co_await bus.async_wait<T>(topic)
 - [x] DropOldest: `publish_mutex_` 串行化 + dequeue-oldest 重试
 - [x] Block / BlockTimeout: `cv_not_full_` 条件变量 wait/notify
 - [x] 构造函数接受 `FullPolicy` 和 `publish_timeout` 参数
+- [x] 丢弃回调：`publish(topic, msg, on_drop)` 逐消息通知 DropOldest/DropNewest 丢弃事件
 
 ### TopicHandle（缓存发布）
 - [x] `TopicHandle<T>` 内部类缓存 TopicId + topic string_view

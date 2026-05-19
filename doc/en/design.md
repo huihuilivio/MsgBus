@@ -184,11 +184,13 @@ inline constexpr TopicId kInvalidTopicId = 0;
 struct IMessage {
     std::atomic<int> ref_count_{0};         // Intrusive reference count
     void (*recycler_)(IMessage*) = nullptr; // Recycle function pointer
+    std::function<void(IMessage&)> on_drop_; // Drop callback (set by publish with on_drop)
 
     virtual TopicId topic_id();
     virtual const std::type_info& type();
     void add_ref() noexcept;
     bool release_ref() noexcept;            // Returns true when count reaches zero
+    void notify_drop();                     // Invoke and clear on_drop_ callback
 };
 
 template <typename T>
@@ -433,6 +435,9 @@ public:
     template <typename T>
     bool publish(std::string_view topic, T msg);          // Publish (pool + lock-free enqueue)
 
+    template <typename T, typename OnDrop>
+    bool publish(std::string_view topic, T msg, OnDrop&& on_drop); // Publish with drop callback
+
     template <typename T, typename Handler>
     SubscriptionId subscribe(std::string_view topic, Handler&& handler); // Supports wildcards
 
@@ -464,6 +469,8 @@ public:
 | `DropNewest` | always `true` | Silently drops new message |
 | `Block` | always `true` | Waits on `cv_not_full_`, woken when dispatcher drains |
 | `BlockTimeout` | `false` on timeout | Same as Block with deadline |
+
+**Drop Callback**: When using `DropOldest` or `DropNewest`, you can pass a callback to `publish()` that is invoked with `(std::string_view topic, const T& data)` when the message is dropped. The callback is stored in `IMessage::on_drop_` and invoked via `notify_drop()` at the point of discard. This is a per-message callback — each publish can specify a different handler. `TopicHandle::publish()` does not support this feature to maintain maximum hot-path performance.
 
 **TopicHandle — Cached Publish**:
 
@@ -680,6 +687,7 @@ co_await bus.async_wait<T>(topic)
 - [x] DropOldest: `publish_mutex_` serialization + dequeue-oldest retry
 - [x] Block / BlockTimeout: `cv_not_full_` condition variable wait/notify
 - [x] Constructor accepts `FullPolicy` and `publish_timeout` parameters
+- [x] Drop callback: `publish(topic, msg, on_drop)` per-message notification for DropOldest/DropNewest
 
 ### TopicHandle (Cached Publish)
 - [x] `TopicHandle<T>` inner class caches TopicId + topic string_view
