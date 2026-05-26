@@ -126,8 +126,8 @@ enum class FullPolicy {
 | 策略 | `publish()` 返回值 | 行为 |
 |------|-------------------|------|
 | `ReturnFalse` | 满时返回 `false` | 调用者决定重试或丢弃 |
-| `DropOldest` | 始终 `true` | 淘汰队列中最旧的消息 |
-| `DropNewest` | 始终 `true` | 静默丢弃新消息 |
+| `DropOldest` | 始终 `true` | 淘汰队列中最旧的消息；可选 `on_drop` 回调 |
+| `DropNewest` | 始终 `true` | 丢弃新消息；可选 `on_drop` 回调 |
 | `Block` | 始终 `true` | 阻塞调用者直到有空间 |
 | `BlockTimeout` | 超时返回 `false` | 阻塞至配置的超时时间 |
 
@@ -151,6 +151,25 @@ bool ok = bus.publish<int>("sensor/count", 42);
 bus.publish<std::string>("log/info", "system started");
 bus.publish<MyStruct>("data/update", {1, 3.14, "hello"});
 ```
+
+### 带丢弃回调的发布
+
+使用 `DropOldest` 或 `DropNewest` 策略时，可以提供一个回调函数，在消息被丢弃时收到通知。回调接收 topic 字符串和被丢弃数据的 const 引用：
+
+```cpp
+msgbus::MessageBus bus(1024, 1, msgbus::FullPolicy::DropOldest);
+bus.start();
+
+bus.publish<int>("sensor/temp", 42,
+    [](std::string_view topic, const int& dropped) {
+        std::cerr << "丢弃: " << topic << " 值: " << dropped << "\n";
+    });
+```
+
+- 回调随消息存储，仅在该消息被丢弃时调用
+- 不提供回调时，丢弃行为与之前一样（静默丢弃）
+- 仅 `DropOldest` 和 `DropNewest` 策略会触发回调，其他策略不会丢弃消息
+- `TopicHandle::publish()` 不支持丢弃回调（设计上追求极致热路径性能）
 
 ### TopicHandle（缓存发布）
 
@@ -345,14 +364,15 @@ int main() {
 
 1. **类型安全**：同一 topic 只允许一种消息类型。对已有 topic 使用不同类型会抛出 `std::runtime_error`。
 2. **队列满**：`publish()` 在队列满时的行为取决于 `FullPolicy`（默认 `ReturnFalse` 返回 `false`）。参见[背压策略](#背压策略fullpolicy)。
-3. **Handler 线程**：单 dispatcher 模式下所有 handler 在一个线程中执行；多 dispatcher 模式下 handler 在 worker 线程中执行（同 topic 同 worker）。handler 应尽量轻量，避免阻塞。
-4. **Handler 异常**：单个 handler 抛异常不会影响其他订阅者，异常被静默捕获。
-5. **消息顺序**：同一 topic 的消息按 publish 顺序投递（单 dispatcher 直接保证；多 dispatcher 通过 hash 分片到同一 worker 保证）。
-6. **协程安全**：`async_wait` 是一次性等待，收到一条消息后自动取消订阅。内置 `atomic<bool>` 防护多 dispatcher 下的双发 race。确保 `MessageBus` 的生命周期长于所有挂起的协程。
-7. **生命周期**：确保 `MessageBus` 的生命周期长于所有订阅者和协程。在协程挂起期间销毁 bus 会导致未定义行为。
-8. **通配符规则**：`*` 匹配恰好一层，`#` 匹配零层或多层且必须为 pattern 最后一段。
-9. **通配符 handler 线程安全**：多 dispatcher 模式下，通配符匹配的不同 topic 可能在不同 worker 线程中并发调用同一 handler，用户需保证通配符 handler 的线程安全性。
-10. **平台说明**：在支持 `std::atomic<std::shared_ptr>` 的平台（MSVC 19.28+、GCC 12+）上，dispatch 读路径完全无锁。在 Apple Clang / libc++ 上使用简短 mutex 回退（极短临界区，影响极小）。
+3. **丢弃回调**：`publish(topic, msg, on_drop)` 可注册逐消息回调，当 `DropOldest`/`DropNewest` 丢弃该消息时调用，回调签名为 `(std::string_view topic, const T& data)`。参见[带丢弃回调的发布](#带丢弃回调的发布)。
+4. **Handler 线程**：单 dispatcher 模式下所有 handler 在一个线程中执行；多 dispatcher 模式下 handler 在 worker 线程中执行（同 topic 同 worker）。handler 应尽量轻量，避免阻塞。
+5. **Handler 异常**：单个 handler 抛异常不会影响其他订阅者，异常被静默捕获。
+6. **消息顺序**：同一 topic 的消息按 publish 顺序投递（单 dispatcher 直接保证；多 dispatcher 通过 hash 分片到同一 worker 保证）。
+7. **协程安全**：`async_wait` 是一次性等待，收到一条消息后自动取消订阅。内置 `atomic<bool>` 防护多 dispatcher 下的双发 race。确保 `MessageBus` 的生命周期长于所有挂起的协程。
+8. **生命周期**：确保 `MessageBus` 的生命周期长于所有订阅者和协程。在协程挂起期间销毁 bus 会导致未定义行为。
+9. **通配符规则**：`*` 匹配恰好一层，`#` 匹配零层或多层且必须为 pattern 最后一段。
+10. **通配符 handler 线程安全**：多 dispatcher 模式下，通配符匹配的不同 topic 可能在不同 worker 线程中并发调用同一 handler，用户需保证通配符 handler 的线程安全性。
+11. **平台说明**：在支持 `std::atomic<std::shared_ptr>` 的平台（MSVC 19.28+、GCC 12+）上，dispatch 读路径完全无锁。在 Apple Clang / libc++ 上使用简短 mutex 回退（极短临界区，影响极小）。
 
 ## 构建选项
 

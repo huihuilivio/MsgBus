@@ -1,4 +1,4 @@
-#include "msgbus/message_bus.h"
+﻿#include "msgbus/message_bus.h"
 #include "msgbus/object_pool.h"
 #include "msgbus/topic_matcher.h"
 #include "msgbus/topic_registry.h"
@@ -780,6 +780,159 @@ TEST(FullPolicyTest, BlockWaitsAndDrains) {
 
     bus.stop();
     EXPECT_EQ(received.load(), N);
+}
+
+// ---------- Drop Callback Tests ----------
+
+TEST(DropCallbackTest, DropNewestNotifiesCallback) {
+    MessageBus bus(4, 1, FullPolicy::DropNewest);
+    // Do NOT start — queue will fill, causing drops
+    std::vector<int> dropped_values;
+    std::vector<std::string> dropped_topics;
+    std::mutex drop_mu;
+
+    for (int i = 0; i < 20; ++i) {
+        bus.publish<int>("drop/newest", i,
+            [&](std::string_view topic, const int& val) {
+                std::lock_guard<std::mutex> lk(drop_mu);
+                dropped_topics.emplace_back(topic);
+                dropped_values.push_back(val);
+            });
+    }
+
+    EXPECT_FALSE(dropped_values.empty());
+    // All dropped callbacks should report the correct topic
+    for (const auto& t : dropped_topics) {
+        EXPECT_EQ(t, "drop/newest");
+    }
+}
+
+TEST(DropCallbackTest, DropOldestNotifiesCallback) {
+    MessageBus bus(4, 1, FullPolicy::DropOldest);
+    // Do NOT start — queue will fill, causing drops
+    std::vector<int> dropped_values;
+    std::mutex drop_mu;
+
+    for (int i = 0; i < 20; ++i) {
+        bus.publish<int>("drop/oldest", i,
+            [&drop_mu, &dropped_values](std::string_view, const int& val) {
+                std::lock_guard<std::mutex> lk(drop_mu);
+                dropped_values.push_back(val);
+            });
+    }
+
+    EXPECT_FALSE(dropped_values.empty());
+    // With DropOldest, the dropped values should be the earliest ones
+    // (the queue holds the last 4 messages, so first ~16 are dropped)
+    for (int val : dropped_values) {
+        EXPECT_GE(val, 0);
+        EXPECT_LT(val, 20);
+    }
+}
+
+TEST(DropCallbackTest, NoCallbackWithoutDropPolicy) {
+    // ReturnFalse policy — no drop occurs, callback should never fire
+    MessageBus bus(4, 1, FullPolicy::ReturnFalse);
+    bool callback_fired = false;
+
+    for (int i = 0; i < 20; ++i) {
+        bus.publish<int>("no/drop", i,
+            [&callback_fired](std::string_view, const int&) {
+                callback_fired = true;
+            });
+    }
+
+    EXPECT_FALSE(callback_fired);
+}
+
+TEST(DropCallbackTest, NoCallbackWhenQueueNotFull) {
+    // DropNewest but queue never fills (bus is running)
+    MessageBus bus(64, 1, FullPolicy::DropNewest);
+    bus.start();
+
+    std::atomic<int> received{0};
+    bus.subscribe<int>("not/full", [&](const int&) {
+        received.fetch_add(1);
+    });
+
+    bool callback_fired = false;
+    for (int i = 0; i < 10; ++i) {
+        bus.publish<int>("not/full", i,
+            [&callback_fired](std::string_view, const int&) {
+                callback_fired = true;
+            });
+    }
+
+    for (int i = 0; i < 100 && received.load() < 10; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    bus.stop();
+
+    EXPECT_FALSE(callback_fired);
+    EXPECT_EQ(received.load(), 10);
+}
+
+TEST(DropCallbackTest, CallbackReceivesCorrectTopic) {
+    MessageBus bus(2, 1, FullPolicy::DropNewest);
+    // Do NOT start
+    std::string captured_topic;
+    int captured_val = -1;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool dropped = false;
+
+    // Fill queue first
+    bus.publish<int>("topic/a", 1);
+    bus.publish<int>("topic/a", 2);
+
+    // This one should be dropped
+    bus.publish<int>("topic/b", 99,
+        [&](std::string_view topic, const int& val) {
+            std::lock_guard<std::mutex> lk(mu);
+            captured_topic = topic;
+            captured_val = val;
+            dropped = true;
+            cv.notify_one();
+        });
+
+    EXPECT_TRUE(dropped);
+    EXPECT_EQ(captured_topic, "topic/b");
+    EXPECT_EQ(captured_val, 99);
+}
+
+TEST(DropCallbackTest, PublishWithoutCallbackStillWorks) {
+    // DropNewest policy, publish without on_drop — should not crash
+    MessageBus bus(4, 1, FullPolicy::DropNewest);
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_TRUE(bus.publish<int>("no/cb", i));
+    }
+}
+
+TEST(DropCallbackTest, DropOldestMultiProducerWithCallback) {
+    MessageBus bus(16, 1, FullPolicy::DropOldest);
+    bus.start();
+
+    std::atomic<int> drop_count{0};
+    bus.subscribe<int>("mp/drop", [&](const int&) {});
+
+    constexpr int THREADS = 4;
+    constexpr int PER_THREAD = 200;
+    std::vector<std::thread> producers;
+    for (int t = 0; t < THREADS; ++t) {
+        producers.emplace_back([&, t] {
+            for (int i = 0; i < PER_THREAD; ++i) {
+                bus.publish<int>("mp/drop", t * PER_THREAD + i,
+                    [&](std::string_view, const int&) {
+                        drop_count.fetch_add(1, std::memory_order_relaxed);
+                    });
+            }
+        });
+    }
+    for (auto& th : producers) th.join();
+
+    bus.stop();
+    // With a small queue and many producers, some drops should occur
+    EXPECT_GT(drop_count.load(), 0);
 }
 
 TEST(FullPolicyTest, BlockTimeoutWaitsAndDrains) {

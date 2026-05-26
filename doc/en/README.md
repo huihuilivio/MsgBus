@@ -126,8 +126,8 @@ enum class FullPolicy {
 | Policy | `publish()` returns | Behavior |
 |--------|-------------------|----------|
 | `ReturnFalse` | `false` if full | Caller decides retry or discard |
-| `DropOldest` | always `true` | Evicts oldest queued message |
-| `DropNewest` | always `true` | Silently drops the new message |
+| `DropOldest` | always `true` | Evicts oldest queued message; optional `on_drop` callback |
+| `DropNewest` | always `true` | Drops the new message; optional `on_drop` callback |
 | `Block` | always `true` | Blocks caller until space available |
 | `BlockTimeout` | `false` on timeout | Blocks up to the configured timeout |
 
@@ -151,6 +151,25 @@ bool ok = bus.publish<int>("sensor/count", 42);
 bus.publish<std::string>("log/info", "system started");
 bus.publish<MyStruct>("data/update", {1, 3.14, "hello"});
 ```
+
+### Publish with Drop Callback
+
+When using `DropOldest` or `DropNewest` policy, you can provide a callback to be notified when a message is discarded. The callback receives the topic string and a const reference to the dropped data:
+
+```cpp
+msgbus::MessageBus bus(1024, 1, msgbus::FullPolicy::DropOldest);
+bus.start();
+
+bus.publish<int>("sensor/temp", 42,
+    [](std::string_view topic, const int& dropped) {
+        std::cerr << "Dropped on " << topic << ": " << dropped << "\n";
+    });
+```
+
+- The callback is stored with the message and invoked only if that specific message is dropped.
+- Without the callback, drops are silent (same as before).
+- Only `DropOldest` and `DropNewest` policies will invoke the callback; other policies never drop messages.
+- `TopicHandle::publish()` does not support the drop callback (by design, for maximum hot-path performance).
 
 ### TopicHandle (Cached Publish)
 
@@ -343,14 +362,15 @@ int main() {
 
 1. **Type Safety**: Each topic allows only one message type. Using a different type on an existing topic throws `std::runtime_error`.
 2. **Queue Full**: `publish()` behavior on queue full depends on `FullPolicy` (default: `ReturnFalse` returns `false`). See [Backpressure Policy](#backpressure-policy-fullpolicy).
-3. **Handler Threads**: In single-dispatcher mode, all handlers run in one thread; in multi-dispatcher mode, handlers run in worker threads (same topic → same worker). Keep handlers lightweight; avoid blocking.
-4. **Handler Exceptions**: A handler throwing an exception does not affect other subscribers; exceptions are silently caught.
-5. **Message Ordering**: Messages on the same topic are delivered in publish order (single-dispatcher: guaranteed directly; multi-dispatcher: guaranteed via hash sharding to the same worker).
-6. **Coroutine Safety**: `async_wait` is a one-shot wait that auto-unsubscribes after receiving one message. Built-in `atomic<bool>` guard prevents double-resume under multi-dispatcher. Ensure `MessageBus` outlives all pending coroutines.
-7. **Lifetime**: Ensure `MessageBus` outlives all subscribers and coroutines. Destroying the bus while coroutines are suspended leads to undefined behavior.
-8. **Wildcard Rules**: `*` matches exactly one level, `#` matches zero or more trailing levels and must be the last segment.
-9. **Wildcard Handler Thread Safety**: In multi-dispatcher mode, different topics matching the same wildcard pattern may invoke the handler concurrently from different worker threads. Ensure your wildcard handlers are thread-safe.
-10. **Platform Note**: On platforms with `std::atomic<std::shared_ptr>` support (MSVC 19.28+, GCC 12+), the dispatch read path is fully lock-free. On Apple Clang / libc++, a brief mutex fallback is used (very short critical section, minimal impact).
+3. **Drop Callback**: `publish(topic, msg, on_drop)` registers a per-message callback invoked when `DropOldest`/`DropNewest` discards that message. The callback receives `(std::string_view topic, const T& data)`. See [Publish with Drop Callback](#publish-with-drop-callback).
+4. **Handler Threads**: In single-dispatcher mode, all handlers run in one thread; in multi-dispatcher mode, handlers run in worker threads (same topic → same worker). Keep handlers lightweight; avoid blocking.
+5. **Handler Exceptions**: A handler throwing an exception does not affect other subscribers; exceptions are silently caught.
+6. **Message Ordering**: Messages on the same topic are delivered in publish order (single-dispatcher: guaranteed directly; multi-dispatcher: guaranteed via hash sharding to the same worker).
+7. **Coroutine Safety**: `async_wait` is a one-shot wait that auto-unsubscribes after receiving one message. Built-in `atomic<bool>` guard prevents double-resume under multi-dispatcher. Ensure `MessageBus` outlives all pending coroutines.
+8. **Lifetime**: Ensure `MessageBus` outlives all subscribers and coroutines. Destroying the bus while coroutines are suspended leads to undefined behavior.
+9. **Wildcard Rules**: `*` matches exactly one level, `#` matches zero or more trailing levels and must be the last segment.
+10. **Wildcard Handler Thread Safety**: In multi-dispatcher mode, different topics matching the same wildcard pattern may invoke the handler concurrently from different worker threads. Ensure your wildcard handlers are thread-safe.
+11. **Platform Note**: On platforms with `std::atomic<std::shared_ptr>` support (MSVC 19.28+, GCC 12+), the dispatch read path is fully lock-free. On Apple Clang / libc++, a brief mutex fallback is used (very short critical section, minimal impact).
 
 ## Build Options
 

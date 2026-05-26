@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "msgbus/config.h"
 #include "msgbus/lock_free_queue.h"
@@ -154,8 +154,30 @@ public:
             raw = new TypedMessage<T>(tid, std::move(msg));
         }
         raw->recycler_ = &TypedMessagePool<T>::recycle;
-        // Cache topic string for wildcard dispatch (avoids registry reverse lookup)
         raw->set_topic_sv(registry_.to_string(tid));
+        return enqueueMessage(MessagePtr::adopt(raw));
+    }
+
+    /// Publish with a drop callback, invoked when DropOldest/DropNewest discards the message.
+    /// @param on_drop  Callback(topic, data) invoked with the dropped message's topic and data.
+    template <typename T, typename OnDrop>
+    bool publish(std::string_view topic, T msg, OnDrop&& on_drop) {
+        TopicId tid = registry_.resolve(topic);
+        auto& pool = TypedMessagePool<T>::instance();
+        TypedMessage<T>* raw = pool.acquire();
+        if (raw) {
+            raw->reset(tid, std::move(msg));
+        } else {
+            raw = new TypedMessage<T>(tid, std::move(msg));
+        }
+        raw->recycler_ = &TypedMessagePool<T>::recycle;
+        raw->set_topic_sv(registry_.to_string(tid));
+        if constexpr (requires { static_cast<bool>(on_drop); }) {
+            if (!on_drop) return enqueueMessage(MessagePtr::adopt(raw));
+        }
+        raw->on_drop_ = [cb = std::forward<OnDrop>(on_drop)](IMessage& m) {
+            cb(m.topic_sv(), static_cast<TypedMessage<T>&>(m).data_);
+        };
         return enqueueMessage(MessagePtr::adopt(raw));
     }
 
@@ -308,16 +330,19 @@ public:
             }
             raw->recycler_ = &TypedMessagePool<T>::recycle;
             raw->set_topic_sv(topic_sv_);
+            raw->on_drop_ = cached_on_drop_;
             return bus_->enqueueMessage(MessagePtr::adopt(raw));
         }
 
     private:
         friend class MessageBus;
-        TopicHandle(MessageBus* bus, TopicId tid, std::string_view sv)
-            : bus_(bus), tid_(tid), topic_sv_(sv) {}
+        TopicHandle(MessageBus* bus, TopicId tid, std::string_view sv,
+                    std::function<void(IMessage&)> on_drop = {})
+            : bus_(bus), tid_(tid), topic_sv_(sv), cached_on_drop_(std::move(on_drop)) {}
         MessageBus* bus_;
         TopicId tid_;
         std::string_view topic_sv_;
+        std::function<void(IMessage&)> cached_on_drop_;
     };
 
     /// Create a cached handle for high-frequency publishing to the same topic.
@@ -326,6 +351,21 @@ public:
     TopicHandle<T> topic(std::string_view topic) {
         TopicId tid = registry_.resolve(topic);
         return TopicHandle<T>(this, tid, registry_.to_string(tid));
+    }
+
+    /// Create a cached handle with a drop callback for DropOldest/DropNewest.
+    /// The callback is set once at handle creation and reused on every publish.
+    template <typename T, typename OnDrop>
+    TopicHandle<T> topic(std::string_view topic, OnDrop&& on_drop) {
+
+        TopicId tid = registry_.resolve(topic);
+        if constexpr (requires { static_cast<bool>(on_drop); }) {
+            if (!on_drop) return TopicHandle<T>(this, tid, registry_.to_string(tid));
+        }
+        return TopicHandle<T>(this, tid, registry_.to_string(tid),
+            [cb = std::forward<OnDrop>(on_drop)](IMessage& m) {
+                cb(m.topic_sv(), static_cast<TypedMessage<T>&>(m).data_);
+            });
     }
 
 private:
@@ -424,21 +464,30 @@ private:
             if (enqueued) wakeDispatcher();
             return enqueued;
 
-        case FullPolicy::DropNewest:
-            enqueued = queue_.try_enqueue(std::move(mptr));
-            if (enqueued) wakeDispatcher();
+        case FullPolicy::DropNewest: {
+            enqueued = queue_.try_enqueue(mptr); // copy: keep mptr valid for notify_drop
+            if (enqueued) {
+                wakeDispatcher();
+            } else {
+                mptr->notify_drop();
+            }
             return true; // always report success
+        }
 
         case FullPolicy::DropOldest: {
             std::lock_guard<std::mutex> lk(publish_mutex_);
             if (!queue_.try_enqueue(mptr)) { // copy (keep mptr valid for retry)
                 MessagePtr oldest;
-                queue_.try_dequeue(oldest); // discard oldest
+                if (queue_.try_dequeue(oldest)) { // discard oldest
+                    oldest->notify_drop();
+                }
                 // Retry — under publish_mutex_ only this producer enqueues,
                 // so after dequeue the slot is available.  Yield between
                 // retries to avoid busy-spinning while holding the lock.
                 while (!queue_.try_enqueue(mptr)) {
-                    if (!queue_.try_dequeue(oldest)) {
+                    if (queue_.try_dequeue(oldest)) {
+                        oldest->notify_drop();
+                    } else {
                         std::this_thread::yield();
                     }
                 }

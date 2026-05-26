@@ -1,7 +1,8 @@
-#pragma once
+﻿#pragma once
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string_view>
 #include <typeinfo>
 #include <utility>
@@ -16,6 +17,7 @@ inline constexpr TopicId kInvalidTopicId = 0;
 struct IMessage {
     std::atomic<int> ref_count_{0};
     void (*recycler_)(IMessage*) = nullptr;
+    std::function<void(IMessage&)> on_drop_;
 
     virtual ~IMessage() = default;
     virtual TopicId topic_id() const = 0;
@@ -34,6 +36,15 @@ struct IMessage {
         return ref_count_.fetch_sub(1, std::memory_order_acq_rel) == 1;
     }
 
+    /// Invoke and clear the drop callback.
+    void notify_drop() {
+        if (on_drop_) {
+            auto cb = std::move(on_drop_);
+            on_drop_ = nullptr;
+            cb(*this);
+        }
+    }
+
 private:
     std::string_view topic_sv_;
 };
@@ -50,6 +61,7 @@ struct TypedMessage : IMessage {
     void reset(TopicId topic_id, T data) {
         ref_count_.store(0, std::memory_order_relaxed);
         recycler_ = nullptr;
+        on_drop_ = nullptr;
         topic_id_ = topic_id;
         data_ = std::move(data);
     }
