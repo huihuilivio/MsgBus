@@ -17,7 +17,8 @@ inline bool topicMatches(std::string_view pattern, std::string_view topic) {
         }
         if (pattern[pi] == '*') {
             // '*' matches one level: skip to next '/' in both
-            while (ti < topic.size() && topic[ti] != '/') ++ti;
+            while (ti < topic.size() && topic[ti] != '/')
+                ++ti;
             ++pi; // skip '*'
             // Both should now be at '/' or end
             if (pi < pattern.size() && pattern[pi] == '/') ++pi;
@@ -31,8 +32,7 @@ inline bool topicMatches(std::string_view pattern, std::string_view topic) {
     // Handle trailing '#' (matches zero levels)
     if (pi < pattern.size() && pattern[pi] == '#') return true;
     // Handle trailing '/#' when topic already ended (e.g. "sensor/#" vs "sensor")
-    if (pi + 1 < pattern.size() && pattern[pi] == '/' && pattern[pi + 1] == '#')
-        return true;
+    if (pi + 1 < pattern.size() && pattern[pi] == '/' && pattern[pi + 1] == '#') return true;
     return pi == pattern.size() && ti == topic.size();
 }
 
@@ -53,7 +53,7 @@ constexpr bool isValidTopic(std::string_view topic) {
         char c = topic[i];
 
         if (c == '/') {
-            if (last_was_wildcard) return false; // wildcard must be entire segment
+            if (last_was_wildcard) return false;     // wildcard must be entire segment
             if (i == topic.size() - 1) return false; // trailing slash not allowed
             in_segment = false;
             last_was_wildcard = false;
@@ -79,8 +79,7 @@ constexpr bool isValidTopic(std::string_view topic) {
 }
 
 /// Helper for compile-time topic validation with static_assert.
-template<size_t N>
-struct TopicValidator {
+template <size_t N> struct TopicValidator {
     static constexpr bool validate(const char (&topic)[N]) {
         return isValidTopic(std::string_view(topic, N - 1));
     }
@@ -88,8 +87,7 @@ struct TopicValidator {
 
 /// Compile-time topic tag for use in subscribe().
 /// Use like: bus.subscribe<int>(topic_tag("sensor/temp"), handler);
-template<size_t N>
-struct topic_tag {
+template <size_t N> struct topic_tag {
     static constexpr size_t size = N;
     const char (&str)[N];
 
@@ -98,12 +96,12 @@ struct topic_tag {
                       "Invalid MQTT topic: must follow MQTT topic rules");
     }
 
-    constexpr explicit operator std::string_view() const {
-        return std::string_view(str, N - 1);
-    }
+    constexpr explicit operator std::string_view() const { return std::string_view(str, N - 1); }
 };
 } // namespace msgbus
 
 /// Compile-time topic validation macro.
 /// Usage: MSGBUS_VALIDATE_TOPIC("sensor/temp")
-#define MSGBUS_VALIDATE_TOPIC(topic)  static_assert(msgbus::TopicValidator<sizeof(topic)>::validate(topic), "Invalid MQTT topic: " #topic)
+#define MSGBUS_VALIDATE_TOPIC(topic)                                                               \
+    static_assert(msgbus::TopicValidator<sizeof(topic)>::validate(topic),                          \
+                  "Invalid MQTT topic: " #topic)

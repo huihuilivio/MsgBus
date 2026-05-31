@@ -56,21 +56,13 @@ private:
     // with a container that invalidates references (e.g. std::vector, flat_map).
     struct SVHash {
         using is_transparent = void;
-        size_t operator()(std::string_view sv) const {
-            return std::hash<std::string_view>{}(sv);
-        }
+        size_t operator()(std::string_view sv) const { return std::hash<std::string_view>{}(sv); }
     };
     struct SVEqual {
         using is_transparent = void;
-        bool operator()(const std::string& a, std::string_view b) const {
-            return a == b;
-        }
-        bool operator()(std::string_view a, const std::string& b) const {
-            return a == b;
-        }
-        bool operator()(const std::string& a, const std::string& b) const {
-            return a == b;
-        }
+        bool operator()(const std::string& a, std::string_view b) const { return a == b; }
+        bool operator()(std::string_view a, const std::string& b) const { return a == b; }
+        bool operator()(const std::string& a, const std::string& b) const { return a == b; }
     };
     std::unordered_map<std::string, TopicId, SVHash, SVEqual> map_;
     std::unordered_map<TopicId, std::string_view> id_to_sv_;

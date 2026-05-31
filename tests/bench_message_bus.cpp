@@ -36,17 +36,14 @@ static LatencyStats computeStats(std::vector<double>& samples) {
         if (idx >= n) idx = n - 1;
         return samples[idx];
     };
-    return {
-        samples.front(), samples.back(), sum / static_cast<double>(n),
-        pct(0.50), pct(0.90), pct(0.99), pct(0.999)
-    };
+    return {samples.front(), samples.back(), sum / static_cast<double>(n), pct(0.50), pct(0.90),
+            pct(0.99),       pct(0.999)};
 }
 
 static void printStats(const char* label, const LatencyStats& s) {
     std::printf("  %-22s  min=%.2f  avg=%.2f  p50=%.2f  p90=%.2f  "
                 "p99=%.2f  p99.9=%.2f  max=%.2f  (us)\n",
-                label, s.min_us, s.avg_us, s.p50_us, s.p90_us,
-                s.p99_us, s.p999_us, s.max_us);
+                label, s.min_us, s.avg_us, s.p50_us, s.p90_us, s.p99_us, s.p999_us, s.max_us);
 }
 
 // ============================================================
@@ -58,9 +55,8 @@ static void benchThroughput(int total_messages) {
     msgbus::MessageBus bus(65536);
     std::atomic<int> received{0};
 
-    bus.subscribe<int>("bench/tp", [&](const int&) {
-        received.fetch_add(1, std::memory_order_relaxed);
-    });
+    bus.subscribe<int>("bench/tp",
+                       [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
 
     bus.start();
 
@@ -89,15 +85,14 @@ static void benchThroughput(int total_messages) {
 // ============================================================
 static void benchMultiProducer(int num_threads, int per_thread) {
     int total = num_threads * per_thread;
-    std::printf("\n=== Multi-producer: %d threads x %d msgs = %d total ===\n",
-                num_threads, per_thread, total);
+    std::printf("\n=== Multi-producer: %d threads x %d msgs = %d total ===\n", num_threads,
+                per_thread, total);
 
     msgbus::MessageBus bus(65536);
     std::atomic<int> received{0};
 
-    bus.subscribe<int>("bench/mp", [&](const int&) {
-        received.fetch_add(1, std::memory_order_relaxed);
-    });
+    bus.subscribe<int>("bench/mp",
+                       [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     bus.start();
 
     auto t0 = Clock::now();
@@ -113,7 +108,8 @@ static void benchMultiProducer(int num_threads, int per_thread) {
             }
         });
     }
-    for (auto& th : producers) th.join();
+    for (auto& th : producers)
+        th.join();
 
     while (received.load(std::memory_order_relaxed) < total) {
         std::this_thread::yield();
@@ -143,17 +139,15 @@ static void benchLatency(int total_messages) {
     latencies.reserve(total_messages);
     std::atomic<int> received{0};
 
-    bus.subscribe<TimestampedMsg>("bench/lat",
-        [&](const TimestampedMsg& msg) {
-            auto now = Clock::now();
-            double us = std::chrono::duration<double, std::micro>(
-                            now - msg.publish_time).count();
-            {
-                std::lock_guard<std::mutex> lk(lat_mu);
-                latencies.push_back(us);
-            }
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+    bus.subscribe<TimestampedMsg>("bench/lat", [&](const TimestampedMsg& msg) {
+        auto now = Clock::now();
+        double us = std::chrono::duration<double, std::micro>(now - msg.publish_time).count();
+        {
+            std::lock_guard<std::mutex> lk(lat_mu);
+            latencies.push_back(us);
+        }
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
 
     bus.start();
 
@@ -191,17 +185,15 @@ static void benchLatency(int total_messages) {
 // ============================================================
 static void benchMultiTopic(int num_topics, int msgs_per_topic) {
     int total = num_topics * msgs_per_topic;
-    std::printf("\n=== Multi-topic: %d topics x %d msgs = %d total ===\n",
-                num_topics, msgs_per_topic, total);
+    std::printf("\n=== Multi-topic: %d topics x %d msgs = %d total ===\n", num_topics,
+                msgs_per_topic, total);
 
     msgbus::MessageBus bus(65536);
     std::atomic<int> received{0};
 
     for (int t = 0; t < num_topics; ++t) {
         bus.subscribe<int>("bench/topic/" + std::to_string(t),
-            [&](const int&) {
-                received.fetch_add(1, std::memory_order_relaxed);
-            });
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     }
     bus.start();
 
@@ -229,17 +221,15 @@ static void benchMultiTopic(int num_topics, int msgs_per_topic) {
 // Bench 5: Fan-out — 1 publisher, N subscribers per topic
 // ============================================================
 static void benchFanOut(int num_subscribers, int total_messages) {
-    std::printf("\n=== Fan-out: 1 pub / %d subs, %d msgs ===\n",
-                num_subscribers, total_messages);
+    std::printf("\n=== Fan-out: 1 pub / %d subs, %d msgs ===\n", num_subscribers, total_messages);
 
     msgbus::MessageBus bus(65536);
     std::atomic<int> received{0};
     int expected = total_messages * num_subscribers;
 
     for (int s = 0; s < num_subscribers; ++s) {
-        bus.subscribe<int>("bench/fan", [&](const int&) {
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+        bus.subscribe<int>("bench/fan",
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     }
     bus.start();
 
@@ -257,8 +247,8 @@ static void benchFanOut(int num_subscribers, int total_messages) {
 
     double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     double deliveries_per_sec = static_cast<double>(expected) / (elapsed_ms / 1000.0);
-    std::printf("  Elapsed: %.2f ms  |  Deliveries/s: %.0f  (total deliveries: %d)\n",
-                elapsed_ms, deliveries_per_sec, expected);
+    std::printf("  Elapsed: %.2f ms  |  Deliveries/s: %.0f  (total deliveries: %d)\n", elapsed_ms,
+                deliveries_per_sec, expected);
 }
 
 // ============================================================
@@ -299,8 +289,7 @@ static void benchQueueRaw(int total_messages) {
 // Bench 7: Wildcard matching with trie — N patterns, M messages
 // ============================================================
 static void benchWildcard(int num_patterns, int total_messages) {
-    std::printf("\n=== Wildcard: %d patterns, %d msgs ===\n",
-                num_patterns, total_messages);
+    std::printf("\n=== Wildcard: %d patterns, %d msgs ===\n", num_patterns, total_messages);
 
     msgbus::MessageBus bus(65536);
     std::atomic<int> received{0};
@@ -308,9 +297,8 @@ static void benchWildcard(int num_patterns, int total_messages) {
     // Create N wildcard patterns: "bench/wild/N/#"
     for (int p = 0; p < num_patterns; ++p) {
         std::string pattern = "bench/wild/" + std::to_string(p) + "/#";
-        bus.subscribe<int>(pattern, [&](const int&) {
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+        bus.subscribe<int>(pattern,
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     }
     bus.start();
 
@@ -336,17 +324,16 @@ static void benchWildcard(int num_patterns, int total_messages) {
 // Bench 8: Wildcard trie RCU — concurrent match throughput
 // ============================================================
 static void benchWildcardRCU(int num_patterns, int total_messages, int num_readers) {
-    std::printf("\n=== Wildcard RCU: %d patterns, %d msgs, %d readers ===\n",
-                num_patterns, total_messages, num_readers);
+    std::printf("\n=== Wildcard RCU: %d patterns, %d msgs, %d readers ===\n", num_patterns,
+                total_messages, num_readers);
 
     msgbus::MessageBus bus(65536, static_cast<unsigned>(num_readers));
     std::atomic<int> received{0};
 
     for (int p = 0; p < num_patterns; ++p) {
         std::string pattern = "bench/rcu/" + std::to_string(p) + "/#";
-        bus.subscribe<int>(pattern, [&](const int&) {
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+        bus.subscribe<int>(pattern,
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     }
     bus.start();
 
@@ -372,11 +359,16 @@ static void benchWildcardRCU(int num_patterns, int total_messages, int num_reade
 // ============================================================
 static const char* policyName(msgbus::FullPolicy p) {
     switch (p) {
-    case msgbus::FullPolicy::ReturnFalse: return "ReturnFalse";
-    case msgbus::FullPolicy::DropOldest:  return "DropOldest";
-    case msgbus::FullPolicy::DropNewest:  return "DropNewest";
-    case msgbus::FullPolicy::Block:       return "Block";
-    case msgbus::FullPolicy::BlockTimeout:return "BlockTimeout";
+    case msgbus::FullPolicy::ReturnFalse:
+        return "ReturnFalse";
+    case msgbus::FullPolicy::DropOldest:
+        return "DropOldest";
+    case msgbus::FullPolicy::DropNewest:
+        return "DropNewest";
+    case msgbus::FullPolicy::Block:
+        return "Block";
+    case msgbus::FullPolicy::BlockTimeout:
+        return "BlockTimeout";
     }
     return "Unknown";
 }
@@ -389,9 +381,8 @@ static void benchPolicySingleProducer(msgbus::FullPolicy policy, int total_messa
     msgbus::MessageBus bus(kSmallQueue, 1, policy, std::chrono::milliseconds{50});
     std::atomic<int> received{0};
 
-    bus.subscribe<int>("bench/policy", [&](const int&) {
-        received.fetch_add(1, std::memory_order_relaxed);
-    });
+    bus.subscribe<int>("bench/policy",
+                       [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     bus.start();
 
     int published = 0;
@@ -412,8 +403,7 @@ static void benchPolicySingleProducer(msgbus::FullPolicy policy, int total_messa
 }
 
 /// Multi-producer throughput under each policy.
-static void benchPolicyMultiProducer(msgbus::FullPolicy policy,
-                                     int num_threads, int per_thread) {
+static void benchPolicyMultiProducer(msgbus::FullPolicy policy, int num_threads, int per_thread) {
     constexpr size_t kSmallQueue = 1024;
     int total = num_threads * per_thread;
 
@@ -421,9 +411,8 @@ static void benchPolicyMultiProducer(msgbus::FullPolicy policy,
     std::atomic<int> received{0};
     std::atomic<int> published{0};
 
-    bus.subscribe<int>("bench/policy/mp", [&](const int&) {
-        received.fetch_add(1, std::memory_order_relaxed);
-    });
+    bus.subscribe<int>("bench/policy/mp",
+                       [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     bus.start();
 
     auto t0 = Clock::now();
@@ -438,7 +427,8 @@ static void benchPolicyMultiProducer(msgbus::FullPolicy policy,
             }
         });
     }
-    for (auto& th : producers) th.join();
+    for (auto& th : producers)
+        th.join();
 
     bus.stop(); // drains remaining messages
     auto t1 = Clock::now();
@@ -462,17 +452,15 @@ static void benchPolicyLatency(msgbus::FullPolicy policy, int total_messages) {
     latencies.reserve(total_messages);
     std::atomic<int> received{0};
 
-    bus.subscribe<TimestampedMsg>("bench/policy/lat",
-        [&](const TimestampedMsg& msg) {
-            auto now = Clock::now();
-            double us = std::chrono::duration<double, std::micro>(
-                            now - msg.publish_time).count();
-            {
-                std::lock_guard<std::mutex> lk(lat_mu);
-                latencies.push_back(us);
-            }
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+    bus.subscribe<TimestampedMsg>("bench/policy/lat", [&](const TimestampedMsg& msg) {
+        auto now = Clock::now();
+        double us = std::chrono::duration<double, std::micro>(now - msg.publish_time).count();
+        {
+            std::lock_guard<std::mutex> lk(lat_mu);
+            latencies.push_back(us);
+        }
+        received.fetch_add(1, std::memory_order_relaxed);
+    });
 
     bus.start();
 
@@ -503,8 +491,8 @@ static void benchPolicyLatency(msgbus::FullPolicy policy, int total_messages) {
         std::printf("  %-14s  ", policyName(policy));
         std::printf("delivered=%d  min=%.2f  avg=%.2f  p50=%.2f  p90=%.2f  "
                     "p99=%.2f  max=%.2f  (us)\n",
-                    delivered, stats.min_us, stats.avg_us, stats.p50_us,
-                    stats.p90_us, stats.p99_us, stats.max_us);
+                    delivered, stats.min_us, stats.avg_us, stats.p50_us, stats.p90_us, stats.p99_us,
+                    stats.max_us);
     }
 }
 
@@ -518,7 +506,9 @@ static void benchFullPolicySuite() {
     benchPolicySingleProducer(msgbus::FullPolicy::Block, N);
     benchPolicySingleProducer(msgbus::FullPolicy::BlockTimeout, N);
 
-    std::printf("\n=== FullPolicy Multi-Producer Throughput (4 threads x %d msgs, queue=1024) ===\n", N / 4);
+    std::printf(
+        "\n=== FullPolicy Multi-Producer Throughput (4 threads x %d msgs, queue=1024) ===\n",
+        N / 4);
     benchPolicyMultiProducer(msgbus::FullPolicy::ReturnFalse, 4, N / 4);
     benchPolicyMultiProducer(msgbus::FullPolicy::DropNewest, 4, N / 4);
     benchPolicyMultiProducer(msgbus::FullPolicy::DropOldest, 4, N / 4);
@@ -551,17 +541,16 @@ static double measureQPS(std::function<double()> fn, int rounds = 3) {
 // Bench 10: Multi-dispatcher exact-match throughput
 // ============================================================
 static void benchMultiDispatcher(int num_dispatchers, int total_messages) {
-    std::printf("\n=== Multi-dispatcher: %d dispatchers, %d msgs ===\n",
-                num_dispatchers, total_messages);
+    std::printf("\n=== Multi-dispatcher: %d dispatchers, %d msgs ===\n", num_dispatchers,
+                total_messages);
 
     msgbus::MessageBus bus(65536, static_cast<unsigned>(num_dispatchers));
     std::atomic<int> received{0};
 
     // Subscribe on multiple topics to spread across dispatchers
     for (int t = 0; t < 10; ++t) {
-        bus.subscribe<int>("bench/md/" + std::to_string(t), [&](const int&) {
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+        bus.subscribe<int>("bench/md/" + std::to_string(t),
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     }
     bus.start();
 
@@ -587,17 +576,15 @@ static void benchMultiDispatcher(int num_dispatchers, int total_messages) {
 // Bench 11: Concurrent subscribe/unsubscribe during publish
 // ============================================================
 static void benchConcurrentSubUnsub(int total_messages) {
-    std::printf("\n=== Concurrent Sub/Unsub: %d msgs, 2 sub-churners ===\n",
-                total_messages);
+    std::printf("\n=== Concurrent Sub/Unsub: %d msgs, 2 sub-churners ===\n", total_messages);
 
     msgbus::MessageBus bus(65536);
     std::atomic<int> received{0};
     std::atomic<bool> churning{true};
 
     // Stable subscriber
-    bus.subscribe<int>("bench/churn", [&](const int&) {
-        received.fetch_add(1, std::memory_order_relaxed);
-    });
+    bus.subscribe<int>("bench/churn",
+                       [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     bus.start();
 
     // Subscription churner threads: subscribe + unsubscribe rapidly
@@ -606,8 +593,7 @@ static void benchConcurrentSubUnsub(int total_messages) {
     for (int c = 0; c < 2; ++c) {
         churners.emplace_back([&] {
             while (churning.load(std::memory_order_relaxed)) {
-                auto id = bus.subscribe<int>("bench/churn",
-                    [](const int&) {});
+                auto id = bus.subscribe<int>("bench/churn", [](const int&) {});
                 bus.unsubscribe(id);
                 churn_ops.fetch_add(2, std::memory_order_relaxed);
             }
@@ -626,22 +612,23 @@ static void benchConcurrentSubUnsub(int total_messages) {
     auto t1 = Clock::now();
 
     churning.store(false, std::memory_order_relaxed);
-    for (auto& t : churners) t.join();
+    for (auto& t : churners)
+        t.join();
     bus.stop();
 
     double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     double qps = static_cast<double>(total_messages) / (elapsed_ms / 1000.0);
     int ops = churn_ops.load(std::memory_order_relaxed);
-    std::printf("  Elapsed: %.2f ms  |  Publish QPS: %.0f  |  Sub/Unsub ops: %d\n",
-                elapsed_ms, qps, ops);
+    std::printf("  Elapsed: %.2f ms  |  Publish QPS: %.0f  |  Sub/Unsub ops: %d\n", elapsed_ms, qps,
+                ops);
 }
 
 // ============================================================
 // Bench 12: Raw Queue MPMC — 4 producers / 4 consumers
 // ============================================================
 static void benchQueueMPMC(int total_messages, int num_producers, int num_consumers) {
-    std::printf("\n=== Raw Queue MPMC: %dP/%dC, %d msgs ===\n",
-                num_producers, num_consumers, total_messages);
+    std::printf("\n=== Raw Queue MPMC: %dP/%dC, %d msgs ===\n", num_producers, num_consumers,
+                total_messages);
 
     msgbus::LockFreeQueue<int> q(65536);
     int per_producer = total_messages / num_producers;
@@ -673,8 +660,10 @@ static void benchQueueMPMC(int total_messages, int num_producers, int num_consum
         });
     }
 
-    for (auto& t : producers) t.join();
-    for (auto& t : consumers) t.join();
+    for (auto& t : producers)
+        t.join();
+    for (auto& t : consumers)
+        t.join();
     auto t1 = Clock::now();
 
     double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -686,17 +675,15 @@ static void benchQueueMPMC(int total_messages, int num_producers, int num_consum
 // Bench 13: ObjectPool hit rate impact
 // ============================================================
 static void benchPoolHitRate(int total_messages, bool with_pool) {
-    std::printf("\n=== Pool %s: %d msgs ===\n",
-                with_pool ? "Enabled" : "Bypassed", total_messages);
+    std::printf("\n=== Pool %s: %d msgs ===\n", with_pool ? "Enabled" : "Bypassed", total_messages);
 
     msgbus::MessageBus bus(65536);
     std::atomic<int> received{0};
 
     if (with_pool) {
         // Warm up pool: publish+drain some messages first
-        bus.subscribe<int>("bench/pool", [&](const int&) {
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+        bus.subscribe<int>("bench/pool",
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
         bus.start();
         for (int i = 0; i < 10000; ++i) {
             bus.publish<int>("bench/pool", i);
@@ -723,7 +710,7 @@ static void benchPoolHitRate(int total_messages, bool with_pool) {
     } else {
         for (int i = 0; i < total_messages; ++i) {
             while (!bus.publish<std::string>("bench/pool",
-                       std::string("payload_") + std::to_string(i))) {
+                                             std::string("payload_") + std::to_string(i))) {
                 std::this_thread::yield();
             }
         }
@@ -751,9 +738,8 @@ static void benchStableThroughput() {
     auto run1P1S = [&]() -> double {
         msgbus::MessageBus bus(65536);
         std::atomic<int> received{0};
-        bus.subscribe<int>("bench/stable", [&](const int&) {
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+        bus.subscribe<int>("bench/stable",
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
         bus.start();
         auto t0 = Clock::now();
         for (int i = 0; i < N; ++i) {
@@ -774,9 +760,8 @@ static void benchStableThroughput() {
     auto run4P = [&]() -> double {
         msgbus::MessageBus bus(65536);
         std::atomic<int> received{0};
-        bus.subscribe<int>("bench/stable4", [&](const int&) {
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+        bus.subscribe<int>("bench/stable4",
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
         bus.start();
         int per = N / 4;
         auto t0 = Clock::now();
@@ -788,7 +773,8 @@ static void benchStableThroughput() {
                         std::this_thread::yield();
             });
         }
-        for (auto& th : prods) th.join();
+        for (auto& th : prods)
+            th.join();
         while (received.load(std::memory_order_relaxed) < N)
             std::this_thread::yield();
         auto t1 = Clock::now();
@@ -806,8 +792,7 @@ static void benchStableThroughput() {
 // ============================================================
 int main() {
     std::printf("MsgBus Performance Benchmark\n");
-    std::printf("Hardware concurrency: %u\n",
-                std::thread::hardware_concurrency());
+    std::printf("Hardware concurrency: %u\n", std::thread::hardware_concurrency());
 
     benchQueueRaw(1'000'000);
     benchThroughput(1'000'000);

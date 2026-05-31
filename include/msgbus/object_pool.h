@@ -8,8 +8,7 @@ namespace msgbus {
 
 /// Lock-free object pool backed by a bounded freelist queue.
 /// Objects are not pre-allocated; they are cached after first use.
-template <typename T>
-class ObjectPool {
+template <typename T> class ObjectPool {
 public:
     explicit ObjectPool(size_t capacity) : freelist_(capacity) {}
 

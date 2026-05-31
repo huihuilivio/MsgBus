@@ -87,8 +87,7 @@ public:
     /// @return A guard that keeps the snapshot (and the raw pointers in @p out)
     ///         alive.  Callers MUST store the returned guard until they are done
     ///         using the pointers.
-    [[nodiscard]] SnapshotGuard match(std::string_view topic,
-                                      const std::type_info& msg_type,
+    [[nodiscard]] SnapshotGuard match(std::string_view topic, const std::type_info& msg_type,
                                       std::vector<ITopicSlot*>& out) const {
         auto snap = loadSnapshot();
         if (snap->entry_count == 0) return {};
@@ -98,9 +97,7 @@ public:
     }
 
     /// Returns true if trie has no entries at all. Thread-safe (RCU read).
-    bool empty() const {
-        return loadSnapshot()->entry_count == 0;
-    }
+    bool empty() const { return loadSnapshot()->entry_count == 0; }
 
 private:
     // Transparent hash/equal so find(string_view) avoids allocating a temp std::string.
@@ -112,9 +109,7 @@ private:
     };
     struct SVEqual {
         using is_transparent = void;
-        bool operator()(std::string_view a, std::string_view b) const noexcept {
-            return a == b;
-        }
+        bool operator()(std::string_view a, std::string_view b) const noexcept { return a == b; }
     };
 
     struct Node {
@@ -186,8 +181,8 @@ private:
     }
 
     static void matchNode(const Node* node, const std::vector<std::string_view>& levels,
-                   size_t depth, const std::type_info& msg_type,
-                   std::vector<ITopicSlot*>& out) {
+                          size_t depth, const std::type_info& msg_type,
+                          std::vector<ITopicSlot*>& out) {
         if (!node) return;
 
         // '#' child matches all remaining levels (including zero)
@@ -246,12 +241,12 @@ private:
     }
 
 #if MSGBUS_HAS_ATOMIC_SHARED_PTR
-    std::atomic<std::shared_ptr<const Snapshot>> snapshot_;  // lock-free read via atomic load
+    std::atomic<std::shared_ptr<const Snapshot>> snapshot_; // lock-free read via atomic load
 #else
-    mutable std::mutex rcu_mutex_;                           // fallback: protects snapshot_ copy
+    mutable std::mutex rcu_mutex_; // fallback: protects snapshot_ copy
     std::shared_ptr<const Snapshot> snapshot_;
 #endif
-    std::mutex write_mutex_;                                  // serializes COW writes
+    std::mutex write_mutex_; // serializes COW writes
 };
 
 } // namespace msgbus

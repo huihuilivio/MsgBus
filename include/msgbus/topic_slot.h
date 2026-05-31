@@ -20,17 +20,13 @@ struct ITopicSlot {
     const std::type_info* msg_type = nullptr;
 };
 
-template <typename T>
-class TopicSlot : public ITopicSlot {
+template <typename T> class TopicSlot : public ITopicSlot {
 public:
     using SubscriberList = std::vector<Subscriber<T>>;
 
-    TopicSlot() : subscribers_(std::make_shared<SubscriberList>()) {
-        this->msg_type = &typeid(T);
-    }
+    TopicSlot() : subscribers_(std::make_shared<SubscriberList>()) { this->msg_type = &typeid(T); }
 
-    SubscriptionId addSubscriber(std::function<void(const T&)> handler,
-                                 SubscriptionId id) {
+    SubscriptionId addSubscriber(std::function<void(const T&)> handler, SubscriptionId id) {
         std::lock_guard<std::mutex> lock(write_mutex_);
         auto old = loadSubscribers();
         auto new_list = std::make_shared<SubscriberList>(*old);
@@ -93,10 +89,10 @@ private:
 #if MSGBUS_HAS_ATOMIC_SHARED_PTR
     std::atomic<std::shared_ptr<SubscriberList>> subscribers_;
 #else
-    mutable std::mutex read_mutex_;   // fallback: protects snapshot copy
+    mutable std::mutex read_mutex_; // fallback: protects snapshot copy
     std::shared_ptr<SubscriberList> subscribers_;
 #endif
-    std::mutex write_mutex_;          // serializes COW writes
+    std::mutex write_mutex_; // serializes COW writes
 };
 
 } // namespace msgbus

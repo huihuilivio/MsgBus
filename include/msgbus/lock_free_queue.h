@@ -8,15 +8,11 @@
 namespace msgbus {
 
 /// Bounded MPMC lock-free queue (Dmitry Vyukov's algorithm).
-template <typename T>
-class LockFreeQueue {
+template <typename T> class LockFreeQueue {
 public:
     explicit LockFreeQueue(size_t capacity)
-        : capacity_(roundUpPowerOf2(capacity < 2 ? 2 : capacity))
-        , mask_(capacity_ - 1)
-        , buffer_(new Cell[capacity_])
-        , enqueue_pos_(0)
-        , dequeue_pos_(0) {
+        : capacity_(roundUpPowerOf2(capacity < 2 ? 2 : capacity)), mask_(capacity_ - 1),
+          buffer_(new Cell[capacity_]), enqueue_pos_(0), dequeue_pos_(0) {
         for (size_t i = 0; i < capacity_; ++i) {
             buffer_[i].sequence.store(i, std::memory_order_relaxed);
         }
@@ -24,7 +20,8 @@ public:
 
     ~LockFreeQueue() {
         T dummy;
-        while (try_dequeue(dummy)) {}
+        while (try_dequeue(dummy)) {
+        }
     }
 
     LockFreeQueue(const LockFreeQueue&) = delete;
@@ -38,8 +35,7 @@ public:
             size_t seq = cell->sequence.load(std::memory_order_acquire);
             auto diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
             if (diff == 0) {
-                if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_relaxed)) {
+                if (enqueue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
                     break;
                 }
             } else if (diff < 0) {
@@ -61,8 +57,7 @@ public:
             size_t seq = cell->sequence.load(std::memory_order_acquire);
             auto diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
             if (diff == 0) {
-                if (dequeue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_relaxed)) {
+                if (dequeue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
                     break;
                 }
             } else if (diff < 0) {

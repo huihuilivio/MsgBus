@@ -31,16 +31,14 @@ struct Alert {
 Task waitForChat(msgbus::MessageBus& bus) {
     std::cout << "[Coroutine] Waiting for chat/room1 ...\n";
     auto msg = co_await bus.async_wait<ChatMessage>("chat/room1");
-    std::cout << "[Coroutine] Received: " << msg.user << " says: "
-              << msg.text << "\n";
+    std::cout << "[Coroutine] Received: " << msg.user << " says: " << msg.text << "\n";
 }
 
 // Coroutine: wait for ANY alert using wildcard '#'
 Task waitForAlert(msgbus::MessageBus& bus) {
     std::cout << "[Coroutine] Waiting for alert/# (any alert) ...\n";
     auto a = co_await bus.async_wait<Alert>("alert/#");
-    std::cout << "[Coroutine] Alert code=" << a.code
-              << " detail: " << a.detail << "\n";
+    std::cout << "[Coroutine] Alert code=" << a.code << " detail: " << a.detail << "\n";
 }
 
 // Coroutine: wait for shutdown signal
@@ -53,8 +51,7 @@ Task waitForSignal(msgbus::MessageBus& bus) {
 int main() {
     // Multi-dispatcher with 2 worker threads.
     // Block policy: publish() blocks if queue is full, guarantees delivery.
-    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 2,
-                           msgbus::FullPolicy::Block);
+    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 2, msgbus::FullPolicy::Block);
     bus.start();
 
     // Launch coroutines (start immediately, suspend at co_await)

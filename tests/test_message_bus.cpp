@@ -59,7 +59,8 @@ TEST(TopicRegistryTest, ConcurrentResolve) {
             }
         });
     }
-    for (auto& th : threads) th.join();
+    for (auto& th : threads)
+        th.join();
 
     // All IDs should be unique (no duplicates for different topics)
     std::set<TopicId> unique_ids(ids.begin(), ids.end());
@@ -148,9 +149,7 @@ TEST(MessagePtrTest, SelfMoveAssignment) {
 TEST(MessagePtrTest, RecyclerCalledOnDestroy) {
     auto* raw = new TypedMessage<int>(1, 1);
     // Use data_ as a flag: recycler sets it to a sentinel instead of deleting
-    raw->recycler_ = [](IMessage* msg) {
-        static_cast<TypedMessage<int>*>(msg)->data_ = 12345;
-    };
+    raw->recycler_ = [](IMessage* msg) { static_cast<TypedMessage<int>*>(msg)->data_ = 12345; };
     {
         MessagePtr p = MessagePtr::adopt(raw);
         raw->ref_count_.store(1, std::memory_order_relaxed);
@@ -187,7 +186,7 @@ TEST(TypedMessageTest, Construction) {
 TEST(TypedMessageTest, ResetForReuse) {
     auto* msg = new TypedMessage<int>(1, 1);
     msg->ref_count_.store(5, std::memory_order_relaxed);
-    msg->recycler_ = reinterpret_cast<void(*)(IMessage*)>(0xDEAD); // dummy
+    msg->recycler_ = reinterpret_cast<void (*)(IMessage*)>(0xDEAD); // dummy
 
     msg->reset(2, 99);
 
@@ -362,11 +361,13 @@ TEST(LockFreeQueueTest, MPMCConcurrent) {
             }
         });
     }
-    for (auto& t : threads) t.join();
+    for (auto& t : threads)
+        t.join();
 
     // Verify all messages consumed and sum is correct
     long long expected = 0;
-    for (int i = 1; i <= TOTAL; ++i) expected += i;
+    for (int i = 1; i <= TOTAL; ++i)
+        expected += i;
     EXPECT_EQ(consumed.load(), TOTAL);
     EXPECT_EQ(sum.load(), expected);
 }
@@ -377,7 +378,7 @@ TEST(LockFreeQueueTest, CapacityRounding) {
     EXPECT_TRUE(q.try_enqueue(1));
     EXPECT_TRUE(q.try_enqueue(2));
     EXPECT_TRUE(q.try_enqueue(3));
-    EXPECT_TRUE(q.try_enqueue(4)); // 4 (rounded up from 3)
+    EXPECT_TRUE(q.try_enqueue(4));  // 4 (rounded up from 3)
     EXPECT_FALSE(q.try_enqueue(5)); // full
 }
 
@@ -395,14 +396,11 @@ TEST_F(MessageBusTest, BasicPubSub) {
     std::promise<int> promise;
     auto future = promise.get_future();
 
-    bus.subscribe<int>("test/int", [&promise](const int& val) {
-        promise.set_value(val);
-    });
+    bus.subscribe<int>("test/int", [&promise](const int& val) { promise.set_value(val); });
 
     bus.publish<int>("test/int", 42);
 
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), 42);
 }
 
@@ -411,14 +409,11 @@ TEST_F(MessageBusTest, StringMessage) {
     auto future = promise.get_future();
 
     bus.subscribe<std::string>("test/str",
-        [&promise](const std::string& val) {
-            promise.set_value(val);
-        });
+                               [&promise](const std::string& val) { promise.set_value(val); });
 
     bus.publish<std::string>("test/str", "hello");
 
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), "hello");
 }
 
@@ -431,14 +426,11 @@ TEST_F(MessageBusTest, CustomType) {
     std::promise<Point> promise;
     auto future = promise.get_future();
 
-    bus.subscribe<Point>("geom/point", [&promise](const Point& p) {
-        promise.set_value(p);
-    });
+    bus.subscribe<Point>("geom/point", [&promise](const Point& p) { promise.set_value(p); });
 
     bus.publish<Point>("geom/point", {3.0, 4.0});
 
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     auto result = future.get();
     EXPECT_EQ(result.x, 3.0);
     EXPECT_EQ(result.y, 4.0);
@@ -454,18 +446,15 @@ TEST_F(MessageBusTest, MultipleSubscribers) {
 
     bus.publish<int>("multi", 99);
 
-    ASSERT_EQ(f1.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
-    ASSERT_EQ(f2.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(f1.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_EQ(f2.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(f1.get(), 99);
     EXPECT_EQ(f2.get(), 99);
 }
 
 TEST_F(MessageBusTest, Unsubscribe) {
     std::atomic<int> count{0};
-    auto id = bus.subscribe<int>("unsub",
-        [&count](const int&) { count.fetch_add(1); });
+    auto id = bus.subscribe<int>("unsub", [&count](const int&) { count.fetch_add(1); });
 
     bus.publish<int>("unsub", 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -484,28 +473,22 @@ TEST_F(MessageBusTest, MultipleTopics) {
     auto f_int = p_int.get_future();
     auto f_str = p_str.get_future();
 
-    bus.subscribe<int>("topic/a", [&p_int](const int& v) {
-        p_int.set_value(v);
-    });
-    bus.subscribe<std::string>("topic/b",
-        [&p_str](const std::string& v) { p_str.set_value(v); });
+    bus.subscribe<int>("topic/a", [&p_int](const int& v) { p_int.set_value(v); });
+    bus.subscribe<std::string>("topic/b", [&p_str](const std::string& v) { p_str.set_value(v); });
 
     bus.publish<int>("topic/a", 10);
     bus.publish<std::string>("topic/b", "world");
 
-    ASSERT_EQ(f_int.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
-    ASSERT_EQ(f_str.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(f_int.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_EQ(f_str.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(f_int.get(), 10);
     EXPECT_EQ(f_str.get(), "world");
 }
 
 TEST_F(MessageBusTest, TypeMismatch) {
     bus.subscribe<int>("typed", [](const int&) {});
-    EXPECT_THROW(
-        bus.subscribe<std::string>("typed", [](const std::string&) {}),
-        std::runtime_error);
+    EXPECT_THROW(bus.subscribe<std::string>("typed", [](const std::string&) {}),
+                 std::runtime_error);
 }
 
 TEST_F(MessageBusTest, PublishBeforeSubscribe) {
@@ -515,13 +498,10 @@ TEST_F(MessageBusTest, PublishBeforeSubscribe) {
 
     std::promise<int> promise;
     auto future = promise.get_future();
-    bus.subscribe<int>("late", [&promise](const int& v) {
-        promise.set_value(v);
-    });
+    bus.subscribe<int>("late", [&promise](const int& v) { promise.set_value(v); });
 
     bus.publish<int>("late", 2);
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), 2);
 }
 
@@ -612,9 +592,8 @@ TEST(FullPolicyTest, BlockReleasesOnDequeue) {
     bus.start();
 
     std::atomic<int> received{0};
-    bus.subscribe<int>("block", [&](const int&) {
-        received.fetch_add(1, std::memory_order_relaxed);
-    });
+    bus.subscribe<int>("block",
+                       [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
 
     // Publish more than capacity — Block policy should let all through
     constexpr int N = 50;
@@ -650,9 +629,8 @@ TEST(FullPolicyTest, BlockWakesOnStop) {
     bus.start();
 
     std::atomic<int> received{0};
-    bus.subscribe<int>("stop_wake", [&](const int&) {
-        received.fetch_add(1, std::memory_order_relaxed);
-    });
+    bus.subscribe<int>("stop_wake",
+                       [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
 
     // Publish enough to fill the queue + backlog, then from another thread
     // publish one more that will block when the dispatcher is paused.
@@ -669,7 +647,8 @@ TEST(FullPolicyTest, BlockWakesOnStop) {
 
     // Publish one message to trigger the slow handler (blocks dispatcher)
     slow_bus.publish<int>("block_topic", 0);
-    while (!handler_running.load()) std::this_thread::yield();
+    while (!handler_running.load())
+        std::this_thread::yield();
 
     // Now dispatcher is stuck. Fill the queue.
     for (int i = 0; i < 4; ++i) {
@@ -699,9 +678,7 @@ TEST(FullPolicyTest, DropOldestMultiProducer) {
     bus.start();
 
     std::atomic<int> received{0};
-    bus.subscribe<int>("mp", [&](const int&) {
-        received.fetch_add(1, std::memory_order_relaxed);
-    });
+    bus.subscribe<int>("mp", [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
 
     constexpr int THREADS = 4;
     constexpr int PER_THREAD = 500;
@@ -713,7 +690,8 @@ TEST(FullPolicyTest, DropOldestMultiProducer) {
             }
         });
     }
-    for (auto& th : producers) th.join();
+    for (auto& th : producers)
+        th.join();
 
     // Wait for drain
     for (int i = 0; i < 200 && received.load() < PER_THREAD; ++i) {
@@ -748,7 +726,8 @@ TEST(FullPolicyTest, DropOldestRetryLoop) {
             }
         });
     }
-    for (auto& th : producers) th.join();
+    for (auto& th : producers)
+        th.join();
 
     bus.stop();
     EXPECT_GT(received.load(), 0);
@@ -776,7 +755,8 @@ TEST(FullPolicyTest, BlockWaitsAndDrains) {
             }
         });
     }
-    for (auto& th : publishers) th.join();
+    for (auto& th : publishers)
+        th.join();
 
     bus.stop();
     EXPECT_EQ(received.load(), N);
@@ -792,12 +772,11 @@ TEST(DropCallbackTest, DropNewestNotifiesCallback) {
     std::mutex drop_mu;
 
     for (int i = 0; i < 20; ++i) {
-        bus.publish<int>("drop/newest", i,
-            [&](std::string_view topic, const int& val) {
-                std::lock_guard<std::mutex> lk(drop_mu);
-                dropped_topics.emplace_back(topic);
-                dropped_values.push_back(val);
-            });
+        bus.publish<int>("drop/newest", i, [&](std::string_view topic, const int& val) {
+            std::lock_guard<std::mutex> lk(drop_mu);
+            dropped_topics.emplace_back(topic);
+            dropped_values.push_back(val);
+        });
     }
 
     EXPECT_FALSE(dropped_values.empty());
@@ -815,10 +794,10 @@ TEST(DropCallbackTest, DropOldestNotifiesCallback) {
 
     for (int i = 0; i < 20; ++i) {
         bus.publish<int>("drop/oldest", i,
-            [&drop_mu, &dropped_values](std::string_view, const int& val) {
-                std::lock_guard<std::mutex> lk(drop_mu);
-                dropped_values.push_back(val);
-            });
+                         [&drop_mu, &dropped_values](std::string_view, const int& val) {
+                             std::lock_guard<std::mutex> lk(drop_mu);
+                             dropped_values.push_back(val);
+                         });
     }
 
     EXPECT_FALSE(dropped_values.empty());
@@ -836,10 +815,9 @@ TEST(DropCallbackTest, NoCallbackWithoutDropPolicy) {
     bool callback_fired = false;
 
     for (int i = 0; i < 20; ++i) {
-        bus.publish<int>("no/drop", i,
-            [&callback_fired](std::string_view, const int&) {
-                callback_fired = true;
-            });
+        bus.publish<int>("no/drop", i, [&callback_fired](std::string_view, const int&) {
+            callback_fired = true;
+        });
     }
 
     EXPECT_FALSE(callback_fired);
@@ -851,16 +829,13 @@ TEST(DropCallbackTest, NoCallbackWhenQueueNotFull) {
     bus.start();
 
     std::atomic<int> received{0};
-    bus.subscribe<int>("not/full", [&](const int&) {
-        received.fetch_add(1);
-    });
+    bus.subscribe<int>("not/full", [&](const int&) { received.fetch_add(1); });
 
     bool callback_fired = false;
     for (int i = 0; i < 10; ++i) {
-        bus.publish<int>("not/full", i,
-            [&callback_fired](std::string_view, const int&) {
-                callback_fired = true;
-            });
+        bus.publish<int>("not/full", i, [&callback_fired](std::string_view, const int&) {
+            callback_fired = true;
+        });
     }
 
     for (int i = 0; i < 100 && received.load() < 10; ++i) {
@@ -886,14 +861,13 @@ TEST(DropCallbackTest, CallbackReceivesCorrectTopic) {
     bus.publish<int>("topic/a", 2);
 
     // This one should be dropped
-    bus.publish<int>("topic/b", 99,
-        [&](std::string_view topic, const int& val) {
-            std::lock_guard<std::mutex> lk(mu);
-            captured_topic = topic;
-            captured_val = val;
-            dropped = true;
-            cv.notify_one();
-        });
+    bus.publish<int>("topic/b", 99, [&](std::string_view topic, const int& val) {
+        std::lock_guard<std::mutex> lk(mu);
+        captured_topic = topic;
+        captured_val = val;
+        dropped = true;
+        cv.notify_one();
+    });
 
     EXPECT_TRUE(dropped);
     EXPECT_EQ(captured_topic, "topic/b");
@@ -921,14 +895,14 @@ TEST(DropCallbackTest, DropOldestMultiProducerWithCallback) {
     for (int t = 0; t < THREADS; ++t) {
         producers.emplace_back([&, t] {
             for (int i = 0; i < PER_THREAD; ++i) {
-                bus.publish<int>("mp/drop", t * PER_THREAD + i,
-                    [&](std::string_view, const int&) {
-                        drop_count.fetch_add(1, std::memory_order_relaxed);
-                    });
+                bus.publish<int>("mp/drop", t * PER_THREAD + i, [&](std::string_view, const int&) {
+                    drop_count.fetch_add(1, std::memory_order_relaxed);
+                });
             }
         });
     }
-    for (auto& th : producers) th.join();
+    for (auto& th : producers)
+        th.join();
 
     bus.stop();
     // With a small queue and many producers, some drops should occur
@@ -1001,13 +975,9 @@ TEST_F(MessageBusTest, UnsubscribeInvalidId) {
 TEST_F(MessageBusTest, HandlerExceptionIsolation) {
     std::atomic<int> good_count{0};
     // First subscriber throws
-    bus.subscribe<int>("except", [](const int&) {
-        throw std::runtime_error("boom");
-    });
+    bus.subscribe<int>("except", [](const int&) { throw std::runtime_error("boom"); });
     // Second subscriber should still receive
-    bus.subscribe<int>("except", [&good_count](const int&) {
-        good_count.fetch_add(1);
-    });
+    bus.subscribe<int>("except", [&good_count](const int&) { good_count.fetch_add(1); });
 
     bus.publish<int>("except", 1);
     bus.publish<int>("except", 2);
@@ -1022,8 +992,7 @@ TEST_F(MessageBusTest, ConcurrentPublish) {
     constexpr int PER_THREAD = 100;
 
     std::atomic<int> received{0};
-    bus.subscribe<int>("concurrent",
-        [&received](const int&) { received.fetch_add(1); });
+    bus.subscribe<int>("concurrent", [&received](const int&) { received.fetch_add(1); });
 
     std::vector<std::thread> threads;
     for (int t = 0; t < THREADS; ++t) {
@@ -1035,7 +1004,8 @@ TEST_F(MessageBusTest, ConcurrentPublish) {
             }
         });
     }
-    for (auto& th : threads) th.join();
+    for (auto& th : threads)
+        th.join();
 
     // Wait for all messages to be dispatched
     for (int i = 0; i < 100 && received.load() < THREADS * PER_THREAD; ++i) {
@@ -1074,7 +1044,9 @@ struct DestroyableTask {
     explicit DestroyableTask(std::coroutine_handle<promise_type> h) : handle(h) {}
     DestroyableTask(DestroyableTask&& o) noexcept : handle(o.handle) { o.handle = nullptr; }
     DestroyableTask& operator=(DestroyableTask&&) = delete;
-    ~DestroyableTask() { if (handle) handle.destroy(); }
+    ~DestroyableTask() {
+        if (handle) handle.destroy();
+    }
 };
 
 TEST_F(MessageBusTest, CoroutineAsyncWait) {
@@ -1089,8 +1061,7 @@ TEST_F(MessageBusTest, CoroutineAsyncWait) {
 
     bus.publish<int>("coro/test", 123);
 
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), 123);
 }
 
@@ -1106,8 +1077,7 @@ TEST_F(MessageBusTest, CoroutineAsyncWaitString) {
 
     bus.publish<std::string>("coro/str", "coroutine!");
 
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), "coroutine!");
 }
 
@@ -1202,9 +1172,7 @@ TEST(TopicMatcherTest, IsWildcard) {
 
 TEST_F(MessageBusTest, WildcardSingleLevel) {
     std::atomic<int> count{0};
-    bus.subscribe<int>("sensor/*/temp", [&](const int&) {
-        count.fetch_add(1);
-    });
+    bus.subscribe<int>("sensor/*/temp", [&](const int&) { count.fetch_add(1); });
 
     bus.publish<int>("sensor/1/temp", 10);
     bus.publish<int>("sensor/2/temp", 20);
@@ -1216,9 +1184,7 @@ TEST_F(MessageBusTest, WildcardSingleLevel) {
 
 TEST_F(MessageBusTest, WildcardMultiLevel) {
     std::atomic<int> count{0};
-    bus.subscribe<int>("system/#", [&](const int&) {
-        count.fetch_add(1);
-    });
+    bus.subscribe<int>("system/#", [&](const int&) { count.fetch_add(1); });
 
     bus.publish<int>("system/cpu", 1);
     bus.publish<int>("system/mem/used", 2);
@@ -1231,9 +1197,7 @@ TEST_F(MessageBusTest, WildcardMultiLevel) {
 
 TEST_F(MessageBusTest, WildcardUnsubscribe) {
     std::atomic<int> count{0};
-    auto id = bus.subscribe<int>("event/#", [&](const int&) {
-        count.fetch_add(1);
-    });
+    auto id = bus.subscribe<int>("event/#", [&](const int&) { count.fetch_add(1); });
 
     bus.publish<int>("event/click", 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1250,12 +1214,8 @@ TEST_F(MessageBusTest, WildcardAndExactCoexist) {
     std::atomic<int> exact_count{0};
     std::atomic<int> wild_count{0};
 
-    bus.subscribe<int>("data/temp", [&](const int&) {
-        exact_count.fetch_add(1);
-    });
-    bus.subscribe<int>("data/*", [&](const int&) {
-        wild_count.fetch_add(1);
-    });
+    bus.subscribe<int>("data/temp", [&](const int&) { exact_count.fetch_add(1); });
+    bus.subscribe<int>("data/*", [&](const int&) { wild_count.fetch_add(1); });
 
     bus.publish<int>("data/temp", 42);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1278,13 +1238,10 @@ TEST_F(MultiDispatcherTest, BasicPubSub) {
     std::promise<int> promise;
     auto future = promise.get_future();
 
-    bus.subscribe<int>("multi/test", [&](const int& v) {
-        promise.set_value(v);
-    });
+    bus.subscribe<int>("multi/test", [&](const int& v) { promise.set_value(v); });
     bus.publish<int>("multi/test", 99);
 
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), 99);
 }
 
@@ -1294,9 +1251,7 @@ TEST_F(MultiDispatcherTest, ConcurrentMultiTopic) {
 
     std::atomic<int> received{0};
     for (int t = 0; t < TOPICS; ++t) {
-        bus.subscribe<int>("mt/" + std::to_string(t), [&](const int&) {
-            received.fetch_add(1);
-        });
+        bus.subscribe<int>("mt/" + std::to_string(t), [&](const int&) { received.fetch_add(1); });
     }
 
     std::vector<std::thread> producers;
@@ -1310,7 +1265,8 @@ TEST_F(MultiDispatcherTest, ConcurrentMultiTopic) {
             }
         });
     }
-    for (auto& th : producers) th.join();
+    for (auto& th : producers)
+        th.join();
 
     for (int i = 0; i < 200 && received.load() < TOPICS * MSGS; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1320,9 +1276,7 @@ TEST_F(MultiDispatcherTest, ConcurrentMultiTopic) {
 
 TEST_F(MultiDispatcherTest, WildcardWithMultiDispatcher) {
     std::atomic<int> count{0};
-    bus.subscribe<int>("sensor/#", [&](const int&) {
-        count.fetch_add(1);
-    });
+    bus.subscribe<int>("sensor/#", [&](const int&) { count.fetch_add(1); });
 
     bus.publish<int>("sensor/a", 1);
     bus.publish<int>("sensor/b/c", 2);
@@ -1570,8 +1524,8 @@ TEST(WildcardTrieTest, ConcurrentReadWrite) {
     // Multiple readers + one writer concurrently — RCU must not crash or lose data
     WildcardTrie trie;
     constexpr int NUM_PATTERNS = 100;
-    constexpr int NUM_READERS  = 4;
-    constexpr int READ_ITERS   = 2000;
+    constexpr int NUM_READERS = 4;
+    constexpr int READ_ITERS = 2000;
 
     // Pre-insert some patterns so readers always have something to match
     auto make_slot = [](SubscriptionId id) {
@@ -1581,8 +1535,8 @@ TEST(WildcardTrieTest, ConcurrentReadWrite) {
     };
     for (int i = 0; i < 10; ++i) {
         trie.insert("pre/" + std::to_string(i) + "/#",
-                     {&typeid(int), make_slot(static_cast<SubscriptionId>(i + 1)),
-                      static_cast<SubscriptionId>(i + 1)});
+                    {&typeid(int), make_slot(static_cast<SubscriptionId>(i + 1)),
+                     static_cast<SubscriptionId>(i + 1)});
     }
 
     std::atomic<bool> stop{false};
@@ -1591,8 +1545,7 @@ TEST(WildcardTrieTest, ConcurrentReadWrite) {
     std::thread writer([&] {
         for (int i = 10; i < NUM_PATTERNS && !stop.load(); ++i) {
             auto id = static_cast<SubscriptionId>(i + 1);
-            trie.insert("rcu/" + std::to_string(i) + "/#",
-                         {&typeid(int), make_slot(id), id});
+            trie.insert("rcu/" + std::to_string(i) + "/#", {&typeid(int), make_slot(id), id});
         }
         for (int i = 10; i < NUM_PATTERNS && !stop.load(); ++i) {
             trie.remove(static_cast<SubscriptionId>(i + 1));
@@ -1613,7 +1566,8 @@ TEST(WildcardTrieTest, ConcurrentReadWrite) {
         });
     }
 
-    for (auto& t : readers) t.join();
+    for (auto& t : readers)
+        t.join();
     writer.join();
 
     // Every reader iteration should have matched the pre-inserted pattern
@@ -1677,9 +1631,7 @@ TEST(WildcardTrieTest, InsertAfterFullRemoval) {
 
 TEST_F(MessageBusTest, InvalidWildcardHashNotLast) {
     // '#' must be the last segment
-    EXPECT_THROW(
-        bus.subscribe<int>("a/#/b", [](const int&) {}),
-        std::runtime_error);
+    EXPECT_THROW(bus.subscribe<int>("a/#/b", [](const int&) {}), std::runtime_error);
 }
 
 TEST_F(MessageBusTest, ValidWildcardPatterns) {
@@ -1742,11 +1694,11 @@ TEST_F(MessageBusTest, ConcurrentSubscribeSameTopic) {
 
         for (int t = 0; t < THREADS; ++t) {
             threads.emplace_back([&, t] {
-                ids[t] = bus.subscribe<int>(topic,
-                    [&](const int&) { count.fetch_add(1); });
+                ids[t] = bus.subscribe<int>(topic, [&](const int&) { count.fetch_add(1); });
             });
         }
-        for (auto& th : threads) th.join();
+        for (auto& th : threads)
+            th.join();
 
         bus.publish<int>(topic, 42);
         for (int i = 0; i < 100 && count.load() < THREADS; ++i) {
@@ -1761,9 +1713,7 @@ TEST_F(MessageBusTest, ConcurrentSubscribeSameTopic) {
 TEST_F(MultiDispatcherTest, StopDrainsAllMessages) {
     // Publish messages, then stop immediately → exercises router drain + worker drain
     std::atomic<int> received{0};
-    bus.subscribe<int>("drain/test", [&](const int&) {
-        received.fetch_add(1);
-    });
+    bus.subscribe<int>("drain/test", [&](const int&) { received.fetch_add(1); });
 
     constexpr int N = 200;
     for (int i = 0; i < N; ++i) {
@@ -1785,13 +1735,10 @@ TEST_F(MultiDispatcherTest, RestartAfterStop) {
     std::promise<int> promise;
     auto future = promise.get_future();
 
-    bus.subscribe<int>("restart/test", [&](const int& v) {
-        promise.set_value(v);
-    });
+    bus.subscribe<int>("restart/test", [&](const int& v) { promise.set_value(v); });
     bus.publish<int>("restart/test", 55);
 
-    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)),
-              std::future_status::ready);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(future.get(), 55);
 }
 
@@ -1802,9 +1749,8 @@ TEST_F(MultiDispatcherTest, HighVolumeStopDrain) {
     constexpr int PER_TOPIC = 50;
     std::atomic<int> received{0};
     for (int t = 0; t < NUM_TOPICS; ++t) {
-        bus.subscribe<int>("drain/" + std::to_string(t), [&](const int&) {
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
+        bus.subscribe<int>("drain/" + std::to_string(t),
+                           [&](const int&) { received.fetch_add(1, std::memory_order_relaxed); });
     }
 
     // Blast messages from multiple threads concurrently
@@ -1817,7 +1763,8 @@ TEST_F(MultiDispatcherTest, HighVolumeStopDrain) {
             }
         });
     }
-    for (auto& th : producers) th.join();
+    for (auto& th : producers)
+        th.join();
 
     // stop() triggers routerLoop drain → routeToWorker → workerLoop drain
     bus.stop();
@@ -1886,10 +1833,12 @@ TEST(LockFreeQueueTest, HighContentionMPMC) {
             }
         });
     }
-    for (auto& t : threads) t.join();
+    for (auto& t : threads)
+        t.join();
 
     long long expected = 0;
-    for (int i = 1; i <= TOTAL; ++i) expected += i;
+    for (int i = 1; i <= TOTAL; ++i)
+        expected += i;
     EXPECT_EQ(consumed.load(), TOTAL);
     EXPECT_EQ(sum.load(), expected);
 }

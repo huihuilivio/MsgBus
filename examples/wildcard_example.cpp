@@ -13,33 +13,26 @@ struct Event {
 int main() {
     // BlockTimeout policy: publish() blocks up to 100ms if queue is full,
     // then returns false on timeout.
-    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 1,
-                           msgbus::FullPolicy::BlockTimeout,
+    msgbus::MessageBus bus(msgbus::kDefaultQueueCapacity, 1, msgbus::FullPolicy::BlockTimeout,
                            std::chrono::milliseconds{100});
     bus.start();
 
     // '*' matches exactly one level
     // Matches: home/living_room, home/kitchen, but NOT home/floor1/room2
-    auto sub_star = bus.subscribe<Event>("home/*",
-        [](const Event& e) {
-            std::cout << "[home/*]  source=" << e.source
-                      << "  detail=" << e.detail << "\n";
-        });
+    auto sub_star = bus.subscribe<Event>("home/*", [](const Event& e) {
+        std::cout << "[home/*]  source=" << e.source << "  detail=" << e.detail << "\n";
+    });
 
     // '#' matches zero or more trailing levels
     // Matches: home, home/kitchen, home/floor1/room2, ...
-    auto sub_hash = bus.subscribe<Event>("home/#",
-        [](const Event& e) {
-            std::cout << "[home/#]  source=" << e.source
-                      << "  detail=" << e.detail << "\n";
-        });
+    auto sub_hash = bus.subscribe<Event>("home/#", [](const Event& e) {
+        std::cout << "[home/#]  source=" << e.source << "  detail=" << e.detail << "\n";
+    });
 
     // Exact match on a specific room
-    auto sub_exact = bus.subscribe<Event>("home/kitchen",
-        [](const Event& e) {
-            std::cout << "[home/kitchen]  source=" << e.source
-                      << "  detail=" << e.detail << "\n";
-        });
+    auto sub_exact = bus.subscribe<Event>("home/kitchen", [](const Event& e) {
+        std::cout << "[home/kitchen]  source=" << e.source << "  detail=" << e.detail << "\n";
+    });
 
     std::cout << "--- Publish to home/kitchen ---\n";
     // Matched by: home/* (one level), home/# (multi-level), home/kitchen (exact)
