@@ -8,7 +8,20 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-add_executable(msgbus_tests test_message_bus.cpp)
+add_executable(msgbus_tests
+    test_topic_registry.cpp
+    test_message_ptr.cpp
+    test_object_pool.cpp
+    test_lock_free_queue.cpp
+    test_topic_matcher.cpp
+    test_topic_slot.cpp
+    test_wildcard_trie.cpp
+    test_message_bus_basic.cpp
+    test_message_bus_wildcard.cpp
+    test_message_bus_policies.cpp
+    test_message_bus_coroutine.cpp
+    test_message_bus_multi_dispatcher.cpp
+)
 target_link_libraries(msgbus_tests PRIVATE msgbus GTest::gtest_main)
 
 include(GoogleTest)
